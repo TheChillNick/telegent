@@ -142,3 +142,24 @@ async def test_jsonl_new_complete_lines_only(tmp_path):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+
+def test_persona_and_idle_from_environment(monkeypatch):
+    monkeypatch.setenv("PERSONA", "kai")
+    monkeypatch.setenv("IDLE_ENABLED", "false")
+    monkeypatch.delenv("MAX_CALL_DURATION", raising=False)
+    config = settings()
+    assert config.max_call_duration == 0
+    assert "Jsi Kai" in config.system_instruction
+
+
+async def test_event_text_uses_client_content():
+    from telegent.ai.live_session import GeminiLiveSession
+    sent = []
+    class WS:
+        async def send_client_content(self, **kwargs):
+            sent.append(kwargs)
+    await GeminiLiveSession(WS()).send_prompt('Kai event: task finished')
+    assert sent[0]["turn_complete"] is True
+    assert sent[0]["turns"][0].role == "user"
+    assert sent[0]["turns"][0].parts[0].text == 'Kai event: task finished'
