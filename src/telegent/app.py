@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 import ntgcalls
 from google import genai
@@ -16,6 +16,7 @@ from pyrogram.raw import functions, types
 
 from telegent.ai.live_session import GeminiLiveSession
 from telegent.ai.tools.builtin import default_tools
+from telegent.ai.tools.kai import KaiTools
 from telegent.ai.tools.registry import ToolRegistry
 from telegent.config import Settings
 from telegent.logging_setup import call_logger, get_logger
@@ -38,6 +39,10 @@ class TelegentApp:
         self.tools = ToolRegistry()
         for spec in default_tools():
             self.tools.register(spec)
+        self.kai_tools = KaiTools(settings.kai_api_base, settings.kai_api_token)
+        if settings.kai_api_base:
+            for spec in self.kai_tools.specs():
+                self.tools.register(spec)
         self.sessions: dict[int, CallSession] = {}
         self.rate_limiter = CallRateLimiter(
             settings.max_calls_per_window, settings.call_window_seconds
@@ -180,6 +185,10 @@ class TelegentApp:
         async def factory() -> AsyncIterator[GeminiLiveSession]:
             assert self.gemini_client is not None
             config = genai_types.LiveConnectConfig(
+                session_resumption=genai_types.SessionResumptionConfig(),
+                context_window_compression=genai_types.ContextWindowCompressionConfig(
+                    sliding_window=genai_types.SlidingWindow()
+                ),
                 response_modalities=[genai_types.Modality.AUDIO],
                 input_audio_transcription=genai_types.AudioTranscriptionConfig(),
                 output_audio_transcription=genai_types.AudioTranscriptionConfig(),
@@ -195,11 +204,25 @@ class TelegentApp:
                 ),
                 tools=tools_decl,
             )
-            async with self.gemini_client.aio.live.connect(
-                model=settings.gemini_model, config=config
-            ) as ws:
-                log.info("Terhubung ke Gemini Live API (%s).", settings.gemini_model)
-                yield GeminiLiveSession(ws, logger=log)
+            async with AsyncExitStack() as stack:
+                client = self.gemini_client
+                connection: Any = None
+
+                async def connect(handle):
+                    nonlocal connection
+                    if connection is not None:
+                        await connection.__aexit__(None, None, None)
+                    config.session_resumption = genai_types.SessionResumptionConfig(handle=handle)
+                    connection = client.aio.live.connect(model=settings.gemini_model, config=config)
+                    return await connection.__aenter__()
+
+                async def disconnect():
+                    if connection is not None:
+                        await connection.__aexit__(None, None, None)
+
+                stack.push_async_callback(disconnect)
+                ws = await connect(None)
+                yield GeminiLiveSession(ws, logger=log, reconnect=connect)
 
         return factory
 
