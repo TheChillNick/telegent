@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from telegent.ai.prompt import (
@@ -52,6 +52,24 @@ class Settings(BaseSettings):
     gemini_model: str = DEFAULT_GEMINI_MODEL
     system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION
     greeting_prompt: str = DEFAULT_GREETING_PROMPT
+
+    persona: str = "default"
+    kai_api_base: str = ""
+    kai_api_token: str = ""
+    kai_events_file: str = ""
+
+    @model_validator(mode="after")
+    def apply_persona(self) -> "Settings":
+        if self.persona not in {"default", "kai"}:
+            raise ValueError("PERSONA must be default or kai")
+        if not self.idle_enabled and "max_call_duration" not in self.model_fields_set:
+            self.max_call_duration = 0
+        if self.persona == "kai":
+            if "system_instruction" not in self.model_fields_set:
+                self.system_instruction = Path(__file__).with_name("ai").joinpath("kai.txt").read_text(encoding="utf-8")
+            if "greeting_prompt" not in self.model_fields_set:
+                self.greeting_prompt = "Pozdrav krátce česky jako Kai a nabídni pomoc."
+        return self
 
     # --- Kebijakan akses & beban ---
     allowed_user_ids: str = ""

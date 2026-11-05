@@ -8,6 +8,7 @@ from contextlib import AbstractAsyncContextManager
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
+from telegent.ai.event_reader import read_events
 from telegent.ai.events import (
     AudioOut,
     Interrupted,
@@ -175,6 +176,9 @@ class CallSession:
                 self._tasks.append(asyncio.create_task(self._idle_watchdog()))
                 self._tasks.append(asyncio.create_task(self._enforce_max_duration()))
 
+                if self._settings.kai_events_file:
+                    self._tasks.append(asyncio.create_task(read_events(
+                        self._settings.kai_events_file, self._send_prompt)))
                 await self._ending.wait()
         except asyncio.CancelledError:
             raise

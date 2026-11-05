@@ -9,6 +9,7 @@ description = "Telegent - AI voice agent untuk panggilan Telegram (Gemini Live A
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "httpx>=0.28",
     "pyrogram==2.0.106",
     "tgcrypto==1.2.5",
     "ntgcalls>=3.0.0,<=3.0.2",
@@ -42,3 +43,6 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore:There is no current event loop:DeprecationWarning",
 ]
+
+[tool.setuptools.package-data]
+telegent = ["ai/*.txt"]
