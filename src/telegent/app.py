@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import secrets
+from pathlib import Path
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
@@ -21,6 +23,7 @@ from telegent.ai.tools.registry import ToolRegistry
 from telegent.config import Settings
 from telegent.logging_setup import call_logger, get_logger
 from telegent.rate_limit import CallRateLimiter
+from telegent.outbox import Outbox
 from telegent.telegram.call_session import CallSession, SessionState
 from telegent.telegram.media import NtgAudioSink, external_audio_media
 from telegent.telegram.signaling import SignalingService, to_ntg_rtc_server, to_tg_protocol
@@ -49,6 +52,10 @@ class TelegentApp:
         )
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop = asyncio.Event()
+        self._outbox_task: asyncio.Task | None = None
+        self._outgoing_accept: dict[int, asyncio.Future[Any]] = {}
+        self._outgoing_ready = asyncio.Event()
+        self._outgoing_ready.set()
 
     # ---------------------------------------------------------------- lifecycle
     async def run(self) -> None:
@@ -76,10 +83,22 @@ class TelegentApp:
             self.settings.gemini_model,
         )
 
-        await self._stop.wait()
-        await self._shutdown()
+        try:
+            if self.settings.kai_outbox_dir:
+                self._outbox_task = asyncio.create_task(self._watch_outbox(), name="kai-outbox")
+            await self._stop.wait()
+        finally:
+            await self._shutdown()
 
     async def _shutdown(self) -> None:
+        if self._outbox_task is not None:
+            self._outbox_task.cancel()
+            try:
+                await self._outbox_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                self._log.warning("Outgoing watcher failed (details suppressed); continuing shutdown.")
         self._log.info("Mematikan; menutup %d sesi aktif.", len(self.sessions))
         for session in list(self.sessions.values()):
             await session.close()
@@ -156,6 +175,8 @@ class TelegentApp:
                 self._log.info("[PhoneCall] %s (id=%s)", type(call).__name__, getattr(call, "id", "?"))
                 if isinstance(call, types.PhoneCallRequested):
                     await self._handle_call_requested(call)
+                elif isinstance(call, types.PhoneCallAccepted):
+                    await self._handle_call_accepted(call)
                 elif isinstance(call, types.PhoneCall):
                     await self._handle_call_established(call)
                 elif isinstance(call, types.PhoneCallDiscarded):
@@ -226,6 +247,148 @@ class TelegentApp:
 
         return factory
 
+    async def _watch_outbox(self) -> None:
+        cfg = self.settings
+        box: Outbox | None = None
+        while True:
+            try:
+                if box is None:
+                    box = Outbox(Path(cfg.kai_outbox_dir), self._call_outgoing,
+                                 allowed=cfg.kai_call_user_id > 0 and cfg.kai_call_user_id in cfg.allowed_user_id_set,
+                                 max_per_hour=cfg.kai_call_max_per_hour, min_gap=cfg.kai_call_min_gap,
+                                 stale_seconds=cfg.kai_call_stale_seconds, quiet_start=cfg.kai_call_quiet_start,
+                                 quiet_end=cfg.kai_call_quiet_end, timezone_name=cfg.kai_call_timezone)
+                await box.process(active=bool(self.sessions))
+            except Exception:
+                self._log.warning("Outgoing spool unavailable; no call attempted/retried.")
+            await asyncio.sleep(1)
+
+    @staticmethod
+    def _outcome(session: CallSession, result: str) -> None:
+        future = session.outgoing_result
+        if future is not None and not future.done():
+            future.set_result(result)
+
+    async def _call_outgoing(self, text: str) -> str:
+        """One caller-side attempt. The spool handles queueing and rate policy."""
+        user_id = self.settings.kai_call_user_id
+        if user_id <= 0 or user_id not in self.settings.allowed_user_id_set:
+            return "not-whitelisted"
+        if self.sessions:
+            # Normally prevented by the spool. No await separates its activity
+            # check and this reservation, so incoming calls cannot race it.
+            return "busy"
+        assert self.ntg is not None and self.app is not None
+        log = call_logger(user_id, 0)
+        session = CallSession(
+            user_id=user_id, call_id=0, access_hash=0,
+            sink=NtgAudioSink(self.ntg, user_id), live_factory=self._live_factory(user_id, log),
+            tools=self.tools, settings=self.settings, logger=log,
+            opening_text=text, on_stop=self._make_stop(user_id),
+        )
+        session.set_state(SessionState.OUTGOING_CALL)
+        session.on_hangup = self._make_hangup(session)
+        session.outgoing_result = asyncio.get_running_loop().create_future()
+        self._outgoing_accept[user_id] = asyncio.get_running_loop().create_future()
+        self.sessions[user_id] = session
+        result = "failed"
+        try:
+            result = await asyncio.wait_for(self._dial_outgoing(session), self.settings.kai_call_ring_timeout)
+        except asyncio.TimeoutError:
+            result = "no-answer"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Do not log Pyrogram/native exceptions or text (may contain secrets).
+            self._log.warning("Outgoing setup failed (details suppressed).")
+        finally:
+            outcome = session.outgoing_result
+            if outcome is not None and outcome.done() and not outcome.cancelled():
+                result = outcome.result()
+            self._outgoing_ready.set()
+            self._outgoing_accept.pop(user_id, None)
+            if result != "answered":
+                # Also cancel a remotely ringing call when shutdown interrupts it.
+                if session.call_id and self.sessions.get(user_id) is session:
+                    reason = (types.PhoneCallDiscardReasonMissed() if result == "no-answer"
+                              else types.PhoneCallDiscardReasonDisconnect())
+                    await self._discard_call(session, reason, user_id)
+                await session.close()
+        self._log.info("Outgoing call result=%s", result)
+        return result
+
+    async def _dial_outgoing(self, session: CallSession) -> str:
+        assert self.app is not None and self.ntg is not None
+        user_id = session.user_id
+        peer = await self.app.resolve_peer(user_id)
+        if not isinstance(peer, types.InputPeerUser) or peer.user_id != user_id:
+            raise ValueError("callee is not the configured user")
+        dh = await self.app.invoke(functions.messages.GetDhConfig(version=0, random_length=256))
+        await self.ntg.create_p2p_call(user_id)
+        # ntgcalls hashes g_a itself for the calling side (ga_hash=None).
+        ga_hash = await self.ntg.init_exchange(user_id, ntgcalls.DhConfig(g=dh.g, p=dh.p, random=dh.random), None)
+        self._outgoing_ready.clear()
+        try:
+            request = asyncio.create_task(self.app.invoke(functions.phone.RequestCall(
+                user_id=types.InputUser(user_id=peer.user_id, access_hash=peer.access_hash),  # pyright: ignore[reportArgumentType]
+                random_id=secrets.randbits(31), g_a_hash=ga_hash,
+                protocol=to_tg_protocol(self.ntg.get_protocol()),  # pyright: ignore[reportArgumentType]
+            ), retries=0, timeout=min(15, self.settings.kai_call_ring_timeout), sleep_threshold=0))
+            try:
+                response = await asyncio.shield(request)
+            except asyncio.CancelledError:
+                # Telegram may already be ringing. Keep its response so cleanup
+                # can discard the remote call, including during shutdown. This
+                # can extend local cleanup beyond the ring deadline by RPC latency.
+                try:
+                    response = await request
+                    call = response.phone_call
+                    session.call_id, session.access_hash = call.id, call.access_hash
+                except Exception:
+                    self._log.warning("RequestCall response unavailable; remote state unknown.")
+                raise
+            call = response.phone_call
+            session.call_id, session.access_hash = call.id, call.access_hash
+        finally:
+            # Raw accepted/discarded updates can arrive before the RPC returns.
+            self._outgoing_ready.set()
+        accepted = self._outgoing_accept[user_id]
+        outcome = session.outgoing_result
+        assert outcome is not None
+        await asyncio.wait((accepted, outcome), return_when=asyncio.FIRST_COMPLETED)
+        if outcome.done():
+            return outcome.result()
+        call = accepted.result()
+        auth = await self.ntg.exchange_keys(user_id, call.g_b, 0)
+        if outcome.done():
+            return outcome.result()
+        session.set_state(SessionState.CONFIRMING)
+        confirmation = asyncio.create_task(self.app.invoke(functions.phone.ConfirmCall(
+            peer=types.InputPhoneCall(id=session.call_id, access_hash=session.access_hash),  # pyright: ignore[reportArgumentType]
+            g_a=auth.g_a_or_b, key_fingerprint=auth.key_fingerprint,
+            protocol=to_tg_protocol(self.ntg.get_protocol(), call.protocol),  # pyright: ignore[reportArgumentType]
+        )))
+        try:
+            await asyncio.wait((confirmation, outcome), return_when=asyncio.FIRST_COMPLETED)
+            if outcome.done():
+                return outcome.result()
+            response = confirmation.result()
+        finally:
+            if not confirmation.done():
+                confirmation.cancel()
+            await asyncio.gather(confirmation, return_exceptions=True)
+        await self._handle_call_established(response.phone_call)
+        return await outcome
+
+    async def _handle_call_accepted(self, call: types.PhoneCallAccepted) -> None:
+        await self._outgoing_ready.wait()
+        session = self._session_by_call_id(call.id)
+        if session is None or session.state != SessionState.OUTGOING_CALL:
+            return
+        accepted = self._outgoing_accept.get(session.user_id)
+        if accepted is not None and not accepted.done():
+            accepted.set_result(call)
+
     # ---------------------------------------------------------------- call flow
     async def _handle_call_requested(self, call: types.PhoneCallRequested) -> None:
         user_id = call.admin_id
@@ -289,17 +452,16 @@ class TelegentApp:
             log.info("AcceptCall terkirim; menunggu konfirmasi penelpon.")
         except Exception:  # noqa: BLE001
             log.exception("Gagal menerima panggilan.")
-            self.sessions.pop(user_id, None)
             await session.close()
 
     async def _handle_call_established(self, call: types.PhoneCall) -> None:
-        user_id = call.admin_id or call.participant_id
-        session = self.sessions.get(user_id) or self._session_by_call_id(call.id)
+        await self._outgoing_ready.wait()
+        session = self._session_by_call_id(call.id)
         if session is None:
             self._log.warning("Sesi untuk call id %s tidak ditemukan.", call.id)
             return
 
-        if session.state != SessionState.INCOMING_CALL:
+        if session.state not in (SessionState.INCOMING_CALL, SessionState.CONFIRMING):
             # Update PhoneCall terduplikasi/terlambat: jangan setup media dua kali.
             self._log.warning(
                 "PhoneCall untuk user %s diabaikan (state=%s).",
@@ -318,7 +480,8 @@ class TelegentApp:
 
         try:
             assert self.ntg is not None
-            await self.ntg.exchange_keys(session.user_id, call.g_a_or_b, call.key_fingerprint)
+            if not session.outgoing:
+                await self.ntg.exchange_keys(session.user_id, call.g_a_or_b, call.key_fingerprint)
             rtc_servers = [to_ntg_rtc_server(conn) for conn in call.connections]
             lib_versions = list(call.protocol.library_versions) if call.protocol else ["13.0.0"]  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -326,7 +489,7 @@ class TelegentApp:
                 session.user_id,
                 rtc_servers,
                 lib_versions,
-                p2p_allowed=True,
+                p2p_allowed=bool(getattr(call, "p2p_allowed", False)),
                 custom_parameters=None,
             )
 
@@ -334,25 +497,34 @@ class TelegentApp:
             await self.ntg.set_stream_sources(session.user_id, ntgcalls.StreamMode.CAPTURE, media)
             await self.ntg.set_stream_sources(session.user_id, ntgcalls.StreamMode.PLAYBACK, media)
 
+            if session._closing:
+                return
             log.info("Media P2P terhubung; membuka sesi Gemini.")
             session.start()
+            self._outcome(session, "answered")
         except Exception:  # noqa: BLE001
-            log.exception("Gagal menyiapkan media/koneksi.")
-            self.sessions.pop(session.user_id, None)
+            log.warning("Media setup failed (details suppressed).")
+            self._outcome(session, "failed")
+            await self._discard_call(session, types.PhoneCallDiscardReasonDisconnect(), session.user_id)
             await session.close()
 
     async def _handle_call_discarded(self, call: types.PhoneCallDiscarded) -> None:
+        await self._outgoing_ready.wait()
         session = self._session_by_call_id(call.id)
         if session is None:
             return
-        self.sessions.pop(session.user_id, None)
+        reason = getattr(call, "reason", None)
+        result = ("busy" if isinstance(reason, types.PhoneCallDiscardReasonBusy) else
+                  "no-answer" if isinstance(reason, types.PhoneCallDiscardReasonMissed) else
+                  "declined" if isinstance(reason, types.PhoneCallDiscardReasonHangup) else "failed")
+        self._outcome(session, result)
         call_logger(session.user_id, session.call_id).info("Panggilan berakhir.")
         await session.close()
 
     async def _discard_call(self, call, reason, user_id: int) -> None:
         if self.app is None:
             return
-        peer = types.InputPhoneCall(id=call.id, access_hash=call.access_hash)
+        peer = types.InputPhoneCall(id=getattr(call, "call_id", None) or call.id, access_hash=call.access_hash)
         try:
             await self.app.invoke(
                 functions.phone.DiscardCall(
@@ -360,15 +532,18 @@ class TelegentApp:
                 )
             )
         except Exception:  # noqa: BLE001
-            self._log.exception("Gagal menolak panggilan user=%s", user_id)
+            self._log.warning("Discard failed for user=%s (details suppressed).", user_id)
 
     def _make_stop(self, user_id: int):
         async def stop() -> None:
+            session = self.sessions.get(user_id)
             if self.ntg is not None:
                 try:
                     await self.ntg.stop(user_id)
                 except Exception:  # noqa: BLE001
                     pass
+            if self.sessions.get(user_id) is session:
+                self.sessions.pop(user_id, None)
 
         return stop
 
@@ -393,7 +568,6 @@ class TelegentApp:
                     log.info("Panggilan diakhiri oleh AI (DiscardCall terkirim).")
                 except Exception:  # noqa: BLE001
                     log.exception("Gagal mengirim DiscardCall.")
-            self.sessions.pop(session.user_id, None)
             await session.close()
 
         return hangup

@@ -20,6 +20,11 @@ RUN uv sync --frozen --no-dev --no-editable
 # ---- Runtime: hanya bawa .venv, tanpa toolchain ----
 FROM python:3.13-slim AS runtime
 
+# Quiet hours need the IANA database even on a minimal runtime image.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TELEGRAM_SESSION_DIR=/data

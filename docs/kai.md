@@ -46,3 +46,75 @@ so restrict `ALLOWED_USER_IDS` and concurrency appropriately.
 No outgoing calls, Telegram login, live Gemini access, or real backend requests
 are required for tests: `uv sync --frozen && uv run pytest -q` and
 `uv run pyright src/telegent`.
+
+## Outgoing calls (MOU-316; live validation pending)
+
+`KAI_OUTBOX_DIR` enables a private spool, with no listening port. Unset/empty
+means no watcher and no outgoing calls. Only `KAI_CALL_USER_ID` can be called;
+it must be a positive ID explicitly present in `ALLOWED_USER_IDS` (an empty
+incoming whitelist does **not** authorize outgoing calls).
+
+Write one UTF-8 `*.json` per request, atomically by temporary file + rename:
+
+```json
+{"text":"The build failed. Should I revert it?","priority":"normal","created":1794654000}
+```
+
+Use a private 0700 directory and 0600 files. The host `kai-call` helper in
+Hetzner-Server-Setup implements this contract. The worker polls once per second.
+Files wait while any incoming/outgoing call is present, during quiet hours, or
+when the rate budget is exhausted. Requests older than the stale limit become
+`failed/` results even if they were waiting for another call. Urgent requests
+bypass quiet hours only, never the whitelist, active-call check or rate limits.
+
+| Environment | Default | Meaning |
+| --- | --- | --- |
+| `KAI_OUTBOX_DIR` | empty | Opt-in spool directory |
+| `KAI_CALL_USER_ID` | 0 | Single authorized callee (0 refuses) |
+| `KAI_CALL_MAX_PER_HOUR` | 4 | Rolling-hour attempt budget, including failures |
+| `KAI_CALL_MIN_GAP` | 60 | Seconds between attempt starts |
+| `KAI_CALL_RING_TIMEOUT` | 40 | Seconds for setup/ringing/media; then discard |
+| `KAI_CALL_STALE_SECONDS` | 900 | Maximum queued age in seconds |
+| `KAI_CALL_QUIET_START` | 22 | Quiet-hours start, local hour inclusive |
+| `KAI_CALL_QUIET_END` | 7 | Quiet-hours end, exclusive; equal hours disable quiet hours |
+| `KAI_CALL_TIMEZONE` | Europe/Prague | IANA zone, including DST |
+
+A request is claimed into `processing/` before dialing. `.attempts.json` preserves
+the rolling budget across restarts; an invalid journal prevents dialing until an
+operator repairs it. Interrupted `processing/` requests become `failed`, with no
+redial. Run one telegent process per spool. The runtime image explicitly installs IANA
+`tzdata` for quiet hours; native installations also need a system timezone database. Do not delete the attempt journal to
+work around limits. The queue is polled in filename order; a quiet normal request
+does not prevent a later urgent request from being selected.
+
+Caller flow uses `create_p2p_call`, `init_exchange(..., None)` (ntgcalls returns
+the g_a hash), `phone.RequestCall`, `PhoneCallAccepted`, `exchange_keys(..., g_b, 0)`,
+`phone.ConfirmCall`, and the shared P2P media/signaling and `CallSession` lifecycle.
+Reference: [ntgcalls 3.0.2 caller example](https://github.com/pytgcalls/ntgcalls/blob/v3.0.2/examples/go/ubot/connect_call.go).
+The answer starts the same Gemini Live connection, tools, events and `end_call`
+handling as an incoming call. Its initial user turn marks the request as
+**untrusted data**, caps it at 1,000 characters, and asks Kai to explain it in
+2–3 short Czech sentences ending with the question/decision needed. No request
+text is added to the system instruction or application log.
+
+Completed JSON retains `text`, `priority`, `created` and adds `result`:
+`done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,
+`stale`, `not-whitelisted`, or `invalid`. The ring/setup deadline starts at the
+attempt; the RequestCall RPC disables Pyrogram retries/FloodWait sleeping and
+uses a timeout no longer than 15 seconds or that deadline. If cancellation
+occurs while that RPC is in flight, cleanup retains its response to discard a
+remotely created call; waiting for that response can extend local cleanup beyond
+the deadline. If Telegram never returns an ID, remote state is unknown (logged)
+and no redial is attempted. Invalid JSON produces a result without
+request text. `answered` means P2P setup completed and Gemini startup was
+scheduled, not proof that the entire announcement was heard. The host can forward
+unsuccessful attempts through `hz-tg`; no call is automatically redialed.
+
+Offline tests cover caller handshake/duplicate updates, early acceptance,
+remote busy/decline/missed calls, timeout, cancellation, setup failure,
+whitelist refusal, active-call queueing, normal/urgent quiet hours, stale/invalid
+requests, capped text, and persistent rate limits. **No real Telegram/Gemini call
+has been made for this change.** After review and a separately authorized deploy,
+Claude/Atlas and Štěpán still need to verify ringing, speech, bidirectional audio,
+tools/events, decline/timeout and host fallback on the real account. Automatic
+alerts/briefings must remain disconnected until that live test passes.

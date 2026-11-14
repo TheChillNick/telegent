@@ -57,6 +57,22 @@ class Settings(BaseSettings):
     kai_api_base: str = ""
     kai_api_token: str = ""
     kai_events_file: str = ""
+    kai_outbox_dir: str = ""
+    kai_call_user_id: int = Field(default=0, ge=0)
+    kai_call_max_per_hour: int = Field(default=4, ge=1)
+    kai_call_min_gap: float = Field(default=60, ge=0)
+    kai_call_ring_timeout: float = Field(default=40, gt=0)
+    kai_call_stale_seconds: float = Field(default=900, gt=0)
+    kai_call_quiet_start: int = Field(default=22, ge=0, le=23)
+    kai_call_quiet_end: int = Field(default=7, ge=0, le=23)
+    kai_call_timezone: str = "Europe/Prague"
+
+    @field_validator("kai_call_timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(value)
+        return value
 
     @model_validator(mode="after")
     def apply_persona(self) -> "Settings":
