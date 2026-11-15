@@ -248,3 +248,51 @@ async def test_batas_durasi_nol_tidak_memicu_hangup(settings):
     # Tanpa batas: task langsung selesai tanpa menjadwalkan hangup.
     await asyncio.wait_for(session._enforce_max_duration(), timeout=1.0)
     assert session._hangup_task is None
+
+
+async def test_cancel_close_still_cleans_up_all_tasks(settings):
+    session = make_session(settings=settings, live=FakeLiveSession())
+    worker_stopping = asyncio.Event()
+    release_worker = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def worker():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_stopping.set()
+            await release_worker.wait()
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    async def on_stop():
+        stopped.set()
+
+    session._on_stop = on_stop
+    session._tasks.append(asyncio.create_task(worker()))
+    session._live_task = asyncio.create_task(wait_forever())
+    session._hangup_task = asyncio.create_task(wait_forever())
+    session.pending_signaling.append(b"pending")
+    session.tg_out_queue.put_nowait(b"audio")
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(session.close())
+    await worker_stopping.wait()
+    closing.cancel()
+    release_worker.set()
+    try:
+        await closing
+    except asyncio.CancelledError:
+        pass
+    else:
+        assert False, "close should propagate cancellation"
+    await asyncio.sleep(0)
+
+    assert session._live_task.cancelled()
+    assert session._hangup_task.cancelled()
+    assert not session._tasks
+    assert not session.pending_signaling
+    assert session.tg_out_queue.empty()
+    assert stopped.is_set()
+    assert session.state == SessionState.IDLE
+    await session.close()

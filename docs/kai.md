@@ -73,11 +73,14 @@ bypass quiet hours only, never the whitelist, active-call check or rate limits.
 | `KAI_CALL_USER_ID` | 0 | Single authorized callee (0 refuses) |
 | `KAI_CALL_MAX_PER_HOUR` | 4 | Rolling-hour attempt budget, including failures |
 | `KAI_CALL_MIN_GAP` | 60 | Seconds between attempt starts |
-| `KAI_CALL_RING_TIMEOUT` | 40 | Seconds for setup/ringing/media; then discard |
+| `KAI_CALL_RING_TIMEOUT` | 40 | Seconds from the attempt until the callee answers; then discard (Missed) and result no-answer |
+| `KAI_CALL_SETUP_TIMEOUT` | 15 | Seconds after the answer for key exchange, ConfirmCall and media; then discard and result failed |
 | `KAI_CALL_STALE_SECONDS` | 900 | Maximum queued age in seconds |
 | `KAI_CALL_QUIET_START` | 22 | Quiet-hours start, local hour inclusive |
 | `KAI_CALL_QUIET_END` | 7 | Quiet-hours end, exclusive; equal hours disable quiet hours |
 | `KAI_CALL_TIMEZONE` | Europe/Prague | IANA zone, including DST |
+
+An invalid `KAI_CALL_TIMEZONE` (or an image without the tz database) stops startup of the whole container, incoming calls included.
 
 A request is claimed into `processing/` before dialing. `.attempts.json` preserves
 the rolling budget across restarts; an invalid journal prevents dialing until an
@@ -97,10 +100,11 @@ handling as an incoming call. Its initial user turn marks the request as
 2–3 short Czech sentences ending with the question/decision needed. No request
 text is added to the system instruction or application log.
 
+Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages.
+
 Completed JSON retains `text`, `priority`, `created` and adds `result`:
 `done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,
-`stale`, `not-whitelisted`, or `invalid`. The ring/setup deadline starts at the
-attempt; the RequestCall RPC disables Pyrogram retries/FloodWait sleeping and
+`stale`, `not-whitelisted`, or `invalid`. The ring deadline starts at the attempt and ends at the answer; the setup deadline starts at the answer; the RequestCall RPC disables Pyrogram retries/FloodWait sleeping and
 uses a timeout no longer than 15 seconds or that deadline. If cancellation
 occurs while that RPC is in flight, cleanup retains its response to discard a
 remotely created call; waiting for that response can extend local cleanup beyond
