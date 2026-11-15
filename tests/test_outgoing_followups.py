@@ -193,7 +193,7 @@ async def test_watcher_not_allowed_when_callee_not_whitelisted(monkeypatch, tmp_
 
 
 async def test_busy_guard_refuses_second_outgoing_call(monkeypatch):
-    app, _, invoked, _ = setup_app(monkeypatch)
+    app, _, invoked, _ = setup_app(monkeypatch, kai_call_ring_timeout=0.01)
     app.sessions[7] = object()
     assert await app._call_outgoing('Decision?') == 'busy'
     app.app.resolve_peer.assert_not_awaited()
@@ -201,7 +201,7 @@ async def test_busy_guard_refuses_second_outgoing_call(monkeypatch):
 
 
 async def test_resolved_peer_must_be_the_configured_callee(monkeypatch):
-    app, _, invoked, _ = setup_app(monkeypatch)
+    app, _, invoked, _ = setup_app(monkeypatch, kai_call_ring_timeout=0.01)
     app.app.resolve_peer.return_value = types.InputPeerUser(user_id=8, access_hash=1)
     assert await app._call_outgoing('Decision?') == 'failed'
     assert not any(isinstance(q, functions.phone.RequestCall) for q in invoked)
@@ -258,11 +258,14 @@ async def test_opening_prompt_tells_kai_not_to_obey_the_text(monkeypatch):
 
 
 async def test_no_watcher_when_outbox_dir_unset(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+
     app, _, _, _ = setup_app(monkeypatch, kai_outbox_dir='')
-    app._start_outbox_watcher()
-    assert app._outbox_task is None
-    app.settings.kai_outbox_dir = str(tmp_path)
+    monkeypatch.setattr(app, '_watch_outbox', AsyncMock())
     try:
+        app._start_outbox_watcher()
+        assert app._outbox_task is None
+        app.settings.kai_outbox_dir = str(tmp_path)
         app._start_outbox_watcher()
         assert app._outbox_task is not None
         assert app._outbox_task.get_name() == 'kai-outbox'
