@@ -139,6 +139,22 @@ async def test_p08_confirmcall_rpc_timeout_logged_as_rpc_failure(monkeypatch, ca
     assert result == 'failed'
     assert not app.sessions
     # Honest diagnosis: the deadline did not expire (it was 15 s, the RPC failed at once).
+    assert 'Outgoing setup failed: TimeoutError' in lines, lines
+    assert not any('timed out after answer' in line for line in lines), lines
+
+
+async def test_p08b_key_exchange_timeout_logged_as_setup_failure(monkeypatch, caplog):
+    """A TimeoutError of the key exchange after the answer is `failed`, not the setup deadline."""
+    app, _, _, established = setup_app(monkeypatch, kai_call_ring_timeout=5, kai_call_setup_timeout=15)
+    app.ntg.exchange_keys.side_effect = TimeoutError('Request timed out')
+    caplog.set_level(logging.DEBUG)
+    dial, _ = await start_dial(app)
+    await accept(app, established)
+    result = await asyncio.wait_for(dial, 2)
+    lines = [r.getMessage() for r in caplog.records if 'Outgoing setup' in r.getMessage()]
+    assert result == 'failed'
+    assert not app.sessions
+    assert 'Outgoing setup failed: TimeoutError' in lines, lines
     assert not any('timed out after answer' in line for line in lines), lines
 
 
