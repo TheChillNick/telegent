@@ -46,6 +46,9 @@ def error_label(exc: BaseException) -> str:
     return label
 
 
+NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered anyway
+
+
 class TelegentApp:
     """Aplikasi utama: menerima panggilan Telegram dan menjalankan sesi AI per panggilan."""
 
@@ -575,13 +578,14 @@ class TelegentApp:
     def _make_stop(self, user_id: int):
         async def stop() -> None:
             session = self.sessions.get(user_id)
-            if self.ntg is not None:
-                try:
-                    await self.ntg.stop(user_id)
-                except Exception:  # noqa: BLE001
-                    pass
-            if self.sessions.get(user_id) is session:
-                self.sessions.pop(user_id, None)
+            try:
+                if self.ntg is not None:
+                    await asyncio.wait_for(self.ntg.stop(user_id), NTG_STOP_TIMEOUT)
+            except Exception:  # noqa: BLE001  a hanging native stop must not keep the session registered
+                pass
+            finally:
+                if self.sessions.get(user_id) is session:
+                    self.sessions.pop(user_id, None)
 
         return stop
 
