@@ -20,3 +20,6 @@ build/
 .coverage
 htmlcov/
 
+
+# Pyrogram appends unknown RPC errors here (tests raise UnknownError)
+/unknown_errors.txt

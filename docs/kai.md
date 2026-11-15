@@ -100,7 +100,7 @@ handling as an incoming call. Its initial user turn marks the request as
 2–3 short Czech sentences ending with the question/decision needed. No request
 text is added to the system instruction or application log.
 
-Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages.
+Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages. Keep LOG_LEVEL=INFO: the websockets logger is capped at INFO, because at DEBUG it logs Gemini frames including transcript fragments.
 
 Completed JSON retains `text`, `priority`, `created` and adds `result`:
 `done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,

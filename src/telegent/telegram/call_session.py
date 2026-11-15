@@ -392,6 +392,7 @@ class CallSession:
             interval=0.010,
             prefill_frames=15,
             logger=self._log,
+            reason=self._reason,
         )
 
     # --------------------------------------------------------------- input media
@@ -502,7 +503,10 @@ class CallSession:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self._error("Gagal mengakhiri panggilan", exc)
+                if self.outgoing:
+                    self._error("Gagal mengakhiri panggilan", exc)
+                else:
+                    self._log.exception("Gagal mengakhiri panggilan.")  # incoming: unchanged since ee9ae4b
 
     # --------------------------------------------------------------- anti-idle
     def _note_caller_activity(self) -> None:
