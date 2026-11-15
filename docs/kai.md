@@ -105,7 +105,7 @@ Outgoing calls log state changes, registered tool names and error classes with t
 Completed JSON retains `text`, `priority`, `created` and adds `result`:
 `done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,
 `stale`, `not-whitelisted`, or `invalid`. The ring deadline starts at the attempt and ends at the answer; the setup deadline starts at the answer; the RequestCall RPC disables Pyrogram retries/FloodWait sleeping and
-uses a timeout no longer than 15 seconds or that deadline. If cancellation
+uses a timeout no longer than 15 seconds or that deadline. A RequestCall RPC timeout counts as `no-answer`. After the answer, an RPC timeout of the key exchange or ConfirmCall is `failed` with `Outgoing setup failed: TimeoutError`; only the setup deadline logs `Outgoing setup timed out after answer`. CI runs Python 3.10, 3.12 and 3.13. If cancellation
 occurs while that RPC is in flight, cleanup retains its response to discard a
 remotely created call; waiting for that response can extend local cleanup beyond
 the deadline. If Telegram never returns an ID, remote state is unknown (logged)

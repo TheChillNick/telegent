@@ -29,6 +29,26 @@ from telegent.telegram.media import NtgAudioSink, external_audio_media
 from telegent.telegram.signaling import SignalingService, to_ntg_rtc_server, to_tg_protocol
 
 
+async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
+    """(True, result) if `awaitable` finished in time, (False, None) if the deadline expired.
+
+    Unlike wait_for, an exception raised by the awaitable (TimeoutError included)
+    propagates unchanged, so a Pyrogram RPC timeout is never taken for the deadline.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    if not done:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return False, None
+    return True, task.result()
+
+
 NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered anyway
 
 
@@ -325,16 +345,19 @@ class TelegentApp:
     async def _dial_outgoing(self, session: CallSession) -> str:
         """Ring under the ring deadline, then set up under the setup deadline."""
         try:
-            accepted = await asyncio.wait_for(self._ring_outgoing(session), self.settings.kai_call_ring_timeout)
-        except asyncio.TimeoutError:
+            in_time, accepted = await _within(self._ring_outgoing(session), self.settings.kai_call_ring_timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            return "no-answer"  # RequestCall RPC timeout: same outcome on every Python version
+        if not in_time:
             return "no-answer"
         if isinstance(accepted, str):
             return accepted
-        try:
-            return await asyncio.wait_for(self._setup_outgoing(session, accepted), self.settings.kai_call_setup_timeout)
-        except asyncio.TimeoutError:
+        # An RPC TimeoutError from setup propagates: "Outgoing setup failed: TimeoutError".
+        in_time, result = await _within(self._setup_outgoing(session, accepted), self.settings.kai_call_setup_timeout)
+        if not in_time:
             self._log.warning("Outgoing setup timed out after answer (%.0f s).", self.settings.kai_call_setup_timeout)
             return "failed"
+        return result
 
     async def _ring_outgoing(self, session: CallSession):
         assert self.app is not None and self.ntg is not None
