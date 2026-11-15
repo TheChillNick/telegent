@@ -168,3 +168,79 @@ async def test_minimum_gap_longer_than_hour_survives_restart(tmp_path):
     put(tmp_path, name='two', created=NOW.timestamp()+7200)
     await box.process(active=False, now=NOW+timedelta(hours=2))
     assert len(calls) == 2
+
+
+# --- MOU-414: poison requests must never stop the spool -----------------------------------------
+SURROGATE = b'Z\xe1loha'.decode('utf-8', 'surrogateescape')
+
+
+def put_raw(path, name, raw):
+    (path / (name + '.json')).write_text(raw)
+
+
+@pytest.mark.parametrize('allowed,age', [(True, 0), (False, 0), (True, 3600)], ids=['call', 'not-whitelisted', 'stale'])
+async def test_surrogate_request_is_invalid_and_later_request_rings(tmp_path, allowed, age):
+    put(tmp_path, name='0-bad', text=SURROGATE, created=NOW.timestamp() - age)  # json.dumps escapes it as \udce1
+    put(tmp_path, name='1-good')
+    calls = []
+    box = Outbox(tmp_path, lambda text: calls.append(text), allowed=allowed)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/0-bad.json').read_text()) == {'result': 'invalid'}
+    assert calls == (['Decision?'] if allowed else [])
+
+
+async def test_deeply_nested_request_is_invalid_and_later_request_rings(tmp_path):
+    put_raw(tmp_path, '0-bad', '[' * 60000)
+    put(tmp_path, name='1-good')
+    calls = []
+    box = Outbox(tmp_path, lambda text: calls.append(text), allowed=True)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/0-bad.json').read_text()) == {'result': 'invalid'}
+    assert calls == ['Decision?']
+
+
+async def test_unwritable_claim_is_invalid_without_a_call_or_attempt(tmp_path, monkeypatch):
+    import telegent.outbox as module
+    put(tmp_path, name='0-bad', text='Bad')
+    put(tmp_path, name='1-good')
+    original = module.write_private
+    def fail_claim(path, data):
+        if path.parent.name == 'processing' and data.get('text') == 'Bad':
+            raise UnicodeEncodeError('utf-8', 'x', 0, 1, 'surrogates not allowed')
+        original(path, data)
+    monkeypatch.setattr(module, 'write_private', fail_claim)
+    calls = []
+    box = Outbox(tmp_path, lambda text: calls.append(text), allowed=True)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/0-bad.json').read_text()) == {'result': 'invalid'}
+    assert calls == ['Decision?']
+    assert json.loads((tmp_path / '.attempts.json').read_text()) == [NOW.timestamp()]
+    assert not list((tmp_path / 'processing').iterdir())
+
+
+@pytest.mark.parametrize('raw', ['[' * 60000, '{"text": "Z\\udce1loha", "priority": "urgent", "created": 1, "result": "answered"}'], ids=['nested', 'surrogate'])
+async def test_poison_claim_left_in_processing_is_reconciled(tmp_path, raw):
+    (tmp_path / 'processing').mkdir()
+    put_raw(tmp_path / 'processing', 'old', raw)
+    put(tmp_path, name='new')
+    calls = []
+    box = Outbox(tmp_path, lambda text: calls.append(text), allowed=True)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/old.json').read_text())['result'] == 'failed'
+    assert calls == ['Decision?']
+
+
+async def test_reconcile_write_error_on_content_falls_back_to_empty_failed(tmp_path, monkeypatch):
+    import telegent.outbox as module
+    (tmp_path / 'processing').mkdir()
+    put(tmp_path / 'processing', 'old')
+    original = module.write_private
+    def reject_text(path, data):
+        if 'text' in data:
+            raise UnicodeEncodeError('utf-8', 'x', 0, 1, 'surrogates not allowed')
+        original(path, data)
+    monkeypatch.setattr(module, 'write_private', reject_text)
+    box = Outbox(tmp_path, lambda text: pytest.fail('redial'), allowed=True)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/old.json').read_text()) == {'result': 'failed'}
+    assert not list((tmp_path / 'processing').iterdir())

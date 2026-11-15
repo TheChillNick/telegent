@@ -67,6 +67,10 @@ class Outbox:
                 or not isinstance(created, (float, int)) or isinstance(created, bool)
                 or not math.isfinite(created)):
             raise ValueError('invalid request')
+        try:
+            text.encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError('invalid request') from None  # e.g. a lone surrogate from a non-UTF-8 terminal
         return {'text': text[:1000], 'priority': data['priority'], 'created': created}
 
     def _finish(self, path: Path, data: dict[str, Any], result: str) -> None:
@@ -91,9 +95,12 @@ class Outbox:
                 result = original.get('result', 'failed')
                 if result not in {'answered', 'declined', 'busy', 'no-answer', 'failed', 'not-whitelisted'}:
                     result = 'failed'
-            except (OSError, ValueError, UnicodeError, OverflowError):
+            except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
                 data, result = {}, 'failed'
-            self._finish(path, data, result)
+            try:
+                self._finish(path, data, result)
+            except (ValueError, RecursionError):  # content that cannot be written; OSError still ends the pass
+                self._finish(path, {}, 'failed')
         # Invalid/missing journal fails closed (worker logs and retries reading,
         # never resets quota after corruption). Future entries also consume quota.
         attempts = json.loads(self.journal.read_text()) if self.journal.exists() else []
@@ -114,7 +121,7 @@ class Outbox:
             try:
                 data = self._read(path)
                 data = self._request(data)
-            except (OSError, ValueError, UnicodeError, OverflowError):
+            except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
                 self._finish(path, {}, 'invalid')
                 continue
             if stamp - data['created'] > self.stale_seconds:
@@ -129,7 +136,11 @@ class Outbox:
                 continue
             claimed = self.directory / 'processing' / path.name
             os.replace(path, claimed)
-            write_private(claimed, data)
+            try:
+                write_private(claimed, data)
+            except (ValueError, RecursionError):  # never dialled, journal untouched
+                self._finish(claimed, {}, 'invalid')
+                continue
             # Commit the attempt before invoking Telegram, including failed calls.
             attempts.append(stamp)
             write_private(self.journal, attempts)

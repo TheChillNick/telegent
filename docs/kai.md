@@ -112,7 +112,7 @@ the deadline. If Telegram never returns an ID, remote state is unknown (logged)
 and no redial is attempted. Invalid JSON produces a result without
 request text. `answered` means P2P setup completed and Gemini startup was
 scheduled, not proof that the entire announcement was heard. The host can forward
-unsuccessful attempts through `hz-tg`; no call is automatically redialed.
+unsuccessful attempts through `hz-tg`; no call is automatically redialed. A request whose text is not valid UTF-8 (e.g. a lone surrogate from a non-UTF-8 terminal) or whose JSON nests too deeply becomes `invalid` without request text and never blocks later requests.
 
 Offline tests cover caller handshake/duplicate updates, early acceptance,
 remote busy/decline/missed calls, timeout, cancellation, setup failure,
