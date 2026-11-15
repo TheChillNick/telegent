@@ -77,14 +77,10 @@ async def test_cancelled_close_still_unregisters(settings):
     await asyncio.wait_for(stopped.wait(), 1)
 
 
-import asyncio
-import logging
-from types import SimpleNamespace as NS
 
 from pyrogram.errors import UnknownError, UserPrivacyRestricted
 from pyrogram.raw import functions
 
-from test_outgoing import setup_app, start_dial
 
 
 def test_error_label_names_class_and_rpc_id_only():
@@ -139,17 +135,12 @@ async def test_outgoing_session_keeps_state_tool_and_greeting_error_lines(monkey
     assert 'Private' not in text
 
 
-import asyncio
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pytest
-from pyrogram.raw import functions, types
 
-from telegent.config import Settings
 from telegent.outbox import Outbox
-from test_outgoing import setup_app, start_dial
 
 PRAGUE = ZoneInfo('Europe/Prague')
 

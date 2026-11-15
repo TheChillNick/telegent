@@ -85,11 +85,11 @@ class CallSession:
         self._log = logger
         self._on_stop = on_stop
         self.outgoing = opening_text is not None
-        if self.outgoing:
-            # The shared pipeline logs transcripts, tool arguments/results and
-            # exception contents. Keep it silent for calls seeded by spool data;
-            # the app still logs call IDs, media setup and terminal outcomes.
-            self._log = logging.Logger("telegent.outgoing.private", level=logging.CRITICAL + 1)
+        # Outgoing calls are seeded by spool text: keep state changes, tool names
+        # and error classes in the log, never transcripts, tool arguments/results
+        # or exception messages (they could echo the request).
+        self._tool_log = (logging.Logger("telegent.outgoing.private", level=logging.CRITICAL + 1)
+                          if self.outgoing else logger)
         self.opening_text = opening_text[:1000] if opening_text is not None else None
         self.outgoing_result: asyncio.Future[str] | None = None
 
@@ -131,6 +131,15 @@ class CallSession:
     def set_state(self, new_state: SessionState) -> None:
         self._log.info("Transisi status: %s -> %s", self.state.value, new_state.value)
         self.state = new_state
+
+    def _reason(self, exc: BaseException) -> object:
+        return type(exc).__name__ if self.outgoing else exc
+
+    def _error(self, message: str, exc: BaseException) -> None:
+        if self.outgoing:
+            self._log.warning("%s: %s", message, type(exc).__name__)
+        else:
+            self._log.exception("%s: %s", message, exc)
 
     @staticmethod
     def _drain_queue(queue: asyncio.Queue) -> None:
@@ -188,7 +197,7 @@ class CallSession:
                         )
                     await live.send_greeting(prompt)
                 except Exception as exc:  # noqa: BLE001
-                    self._log.warning("Gagal mengirim sapaan awal: %s", exc)
+                    self._log.warning("Gagal mengirim sapaan awal: %s", self._reason(exc))
 
                 self._tasks.append(asyncio.create_task(self._gemini_sender_worker()))
                 self._tasks.append(asyncio.create_task(self._gemini_receiver_worker()))
@@ -204,7 +213,7 @@ class CallSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self._log.exception("Kesalahan sesi live: %s", exc)
+            self._error("Kesalahan sesi live", exc)
         finally:
             await self.close()
 
@@ -230,6 +239,14 @@ class CallSession:
         if self._closing:
             return
         self._closing = True
+        try:
+            await self._close_tasks()
+        finally:
+            # Always unregister, even if close() is cancelled while tasks die.
+            await self._stop_media()
+        self.set_state(SessionState.IDLE)
+
+    async def _close_tasks(self) -> None:
         self.set_state(SessionState.ENDING)
         self._ending.set()
 
@@ -257,13 +274,16 @@ class CallSession:
         self.pending_signaling.clear()
         self.flush_outbound()
 
-        if self._on_stop is not None:
-            try:
-                await self._on_stop()
-            except Exception as exc:  # noqa: BLE001
-                self._log.warning("Gagal menghentikan media: %s", exc)
-
-        self.set_state(SessionState.IDLE)
+    async def _stop_media(self) -> None:
+        if self._on_stop is None:
+            return
+        stop = asyncio.ensure_future(self._on_stop())
+        try:
+            await asyncio.shield(stop)
+        except asyncio.CancelledError:
+            raise  # the shielded stop still finishes and unregisters the session
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Gagal menghentikan media: %s", self._reason(exc))
 
     # --------------------------------------------------------------- workers
     async def _gemini_sender_worker(self) -> None:
@@ -292,7 +312,7 @@ class CallSession:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
-                        self._log.warning("Gagal mengirim audio ke Gemini: %s", exc)
+                        self._log.warning("Gagal mengirim audio ke Gemini: %s", self._reason(exc))
                         break
                 await cadence.wait(0.1)
         except asyncio.CancelledError:
@@ -310,10 +330,12 @@ class CallSession:
                     for frame in self._outbound_framer.push(pcm48):
                         await self._enqueue_outbound(frame)
                 elif isinstance(event, TranscriptIn):
-                    self._log.info("[Penelpon] %s", event.text)
+                    if not self.outgoing:
+                        self._log.info("[Penelpon] %s", event.text)
                     self._note_caller_activity()
                 elif isinstance(event, TranscriptOut):
-                    self._log.info("[AI] %s", event.text)
+                    if not self.outgoing:
+                        self._log.info("[AI] %s", event.text)
                 elif isinstance(event, Interrupted):
                     self._note_caller_activity()
                     if not self.is_greeting:
@@ -329,7 +351,7 @@ class CallSession:
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
-            self._log.exception("Kesalahan penerima Gemini: %s", exc)
+            self._error("Kesalahan penerima Gemini", exc)
 
     async def _enqueue_outbound(self, frame: bytes) -> None:
         self._last_output_activity = time.monotonic()
@@ -389,11 +411,14 @@ class CallSession:
         self._tool_tasks[event.id] = task
 
     async def _run_tool(self, request: ToolRequest) -> None:
-        self._log.info("Menjalankan tool '%s' args=%s", request.name, request.args)
+        if self.outgoing:
+            self._log.info("Menjalankan tool '%s'.", self._tool_name(request.name))
+        else:
+            self._log.info("Menjalankan tool '%s' args=%s", request.name, request.args)
         ctx = ToolContext(
             user_id=self.user_id,
             call_id=self.call_id,
-            logger=self._log,
+            logger=self._tool_log,
             hangup=self.schedule_hangup,
         )
         try:
@@ -404,11 +429,18 @@ class CallSession:
         if self._live is not None:
             try:
                 await self._live.send_tool_response([result])
-                self._log.info("Tool '%s' selesai: %s", request.name, result.response)
+                if self.outgoing:
+                    self._log.info("Tool '%s' selesai.", self._tool_name(request.name))
+                else:
+                    self._log.info("Tool '%s' selesai: %s", request.name, result.response)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self._log.warning("Gagal mengirim hasil tool '%s': %s", request.name, exc)
+                self._log.warning("Gagal mengirim hasil tool '%s': %s", self._tool_name(request.name), self._reason(exc))
+
+    def _tool_name(self, name: str) -> str:
+        # Gemini chooses the name; log it only when it is a registered tool.
+        return name if (not self.outgoing or name in self._tools.specs) else "<unknown>"
 
     def _cancel_tool(self, tool_id: str) -> None:
         task = self._tool_tasks.pop(tool_id, None)
@@ -458,8 +490,8 @@ class CallSession:
                 await self.on_hangup()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
-                self._log.exception("Gagal mengakhiri panggilan.")
+            except Exception as exc:  # noqa: BLE001
+                self._error("Gagal mengakhiri panggilan", exc)
 
     # --------------------------------------------------------------- anti-idle
     def _note_caller_activity(self) -> None:
@@ -475,7 +507,7 @@ class CallSession:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("Gagal mengirim prompt: %s", exc)
+            self._log.warning("Gagal mengirim prompt: %s", self._reason(exc))
 
     async def _idle_watchdog(self) -> None:
         """Konfirmasi bila penelpon diam; akhiri bila tetap tidak ada respons."""
@@ -512,7 +544,7 @@ class CallSession:
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
-            self._log.exception("Idle watchdog error: %s", exc)
+            self._error("Idle watchdog error", exc)
 
     @property
     def duration_seconds(self) -> int:

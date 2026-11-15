@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     kai_call_max_per_hour: int = Field(default=4, ge=1)
     kai_call_min_gap: float = Field(default=60, ge=0)
     kai_call_ring_timeout: float = Field(default=40, gt=0)
+    kai_call_setup_timeout: float = Field(default=15, gt=0)
     kai_call_stale_seconds: float = Field(default=900, gt=0)
     kai_call_quiet_start: int = Field(default=22, ge=0, le=23)
     kai_call_quiet_end: int = Field(default=7, ge=0, le=23)
