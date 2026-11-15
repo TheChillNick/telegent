@@ -244,3 +244,17 @@ async def test_reconcile_write_error_on_content_falls_back_to_empty_failed(tmp_p
     await box.process(active=False, now=NOW)
     assert json.loads((tmp_path / 'failed/old.json').read_text()) == {'result': 'failed'}
     assert not list((tmp_path / 'processing').iterdir())
+
+
+# MOU-429 R2: a crash-left claim whose raw "result" is not a string must not stop the spool.
+@pytest.mark.parametrize('result', [['x'], {'k': 1}])
+async def test_claim_with_non_string_result_is_reconciled(tmp_path, result):
+    (tmp_path / 'processing').mkdir()
+    (tmp_path / 'processing' / 'old.json').write_text(json.dumps(
+        {'text': 'Old', 'priority': 'urgent', 'created': NOW.timestamp(), 'result': result}))
+    put(tmp_path, name='new')
+    calls = []
+    box = Outbox(tmp_path, lambda text: calls.append(text), allowed=True)
+    await box.process(active=False, now=NOW)
+    assert json.loads((tmp_path / 'failed/old.json').read_text())['result'] == 'failed'
+    assert calls == ['Decision?']

@@ -231,9 +231,11 @@ async def test_q08_call_outgoing_finally_with_cancelled_close_unregisters(monkey
 async def test_hanging_ntg_stop_is_bounded_and_unregisters(monkeypatch):
     import telegent.app as app_module
     monkeypatch.setattr(app_module, "NTG_STOP_TIMEOUT", 0.05)
-    """F2: a hanging ntg.stop is bounded; the session is unregistered and the next call is not busy."""
+    """F2: a hanging ntg.stop is bounded; the session is unregistered, the user stays busy until
+    the native stop ends (a new call would hit ntgcalls.ConnectionError), then the next call is not busy."""
     app, *_ = setup_app(monkeypatch, kai_call_ring_timeout=0.05)
-    app.ntg.stop = lambda uid: asyncio.Event().wait()
+    release = asyncio.Event()
+    app.ntg.stop = lambda uid: release.wait()
     session = make(app.settings, outgoing=True, on_stop=app._make_stop(7))
     app.sessions[7] = session
     closing = asyncio.create_task(session.close())
@@ -243,4 +245,10 @@ async def test_hanging_ntg_stop_is_bounded_and_unregisters(monkeypatch):
         await closing
     await asyncio.sleep(0.1)
     assert 7 not in app.sessions
+    assert 7 in app._native_stops
+    assert await app._call_outgoing('x') == 'busy'
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not app._native_stops
     assert await app._call_outgoing('x') != 'busy'
