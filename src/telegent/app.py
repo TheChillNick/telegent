@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import signal
 import secrets
 from pathlib import Path
@@ -14,7 +13,6 @@ import ntgcalls
 from google import genai
 from google.genai import types as genai_types
 from pyrogram import Client
-from pyrogram.errors import RPCError
 from pyrogram.handlers import RawUpdateHandler
 from pyrogram.raw import functions, types
 
@@ -23,7 +21,7 @@ from telegent.ai.tools.builtin import default_tools
 from telegent.ai.tools.kai import KaiTools
 from telegent.ai.tools.registry import ToolRegistry
 from telegent.config import Settings
-from telegent.logging_setup import call_logger, get_logger
+from telegent.logging_setup import call_logger, error_label, get_logger
 from telegent.rate_limit import CallRateLimiter
 from telegent.outbox import Outbox
 from telegent.telegram.call_session import CallSession, SessionState
@@ -31,19 +29,27 @@ from telegent.telegram.media import NtgAudioSink, external_audio_media
 from telegent.telegram.signaling import SignalingService, to_ntg_rtc_server, to_tg_protocol
 
 
-_RPC_VALUE = re.compile(r"^\[\d{3} [A-Z0-9_]{1,64}\]$")
+async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
+    """(True, result) if `awaitable` finished in time, (False, None) if the deadline expired.
+
+    Unlike wait_for, an exception raised by the awaitable (TimeoutError included)
+    propagates unchanged, so a Pyrogram RPC timeout is never taken for the deadline.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    if not done:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return False, None
+    return True, task.result()
 
 
-def error_label(exc: BaseException) -> str:
-    """Exception class plus Telegram RPC error id; never the exception message."""
-    label = type(exc).__name__
-    if isinstance(exc, RPCError):
-        rpc_id = exc.ID
-        if not rpc_id and isinstance(exc.value, str) and _RPC_VALUE.match(exc.value):
-            rpc_id = exc.value
-        if rpc_id:
-            label = f"{label} {rpc_id}"
-    return label
+NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered anyway
 
 
 class TelegentApp:
@@ -203,7 +209,8 @@ class TelegentApp:
                     try:
                         await self.ntg.send_signaling_data(session.user_id, update.data)
                     except Exception as exc:  # noqa: BLE001
-                        self._log.warning("Gagal memproses signaling masuk: %s", exc)
+                        self._log.warning("Gagal memproses signaling masuk: %s",
+                                          error_label(exc) if session.outgoing else exc)
 
         self.app.add_handler(RawUpdateHandler(handle_raw_update))
 
@@ -338,16 +345,19 @@ class TelegentApp:
     async def _dial_outgoing(self, session: CallSession) -> str:
         """Ring under the ring deadline, then set up under the setup deadline."""
         try:
-            accepted = await asyncio.wait_for(self._ring_outgoing(session), self.settings.kai_call_ring_timeout)
-        except asyncio.TimeoutError:
+            in_time, accepted = await _within(self._ring_outgoing(session), self.settings.kai_call_ring_timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            return "no-answer"  # RequestCall RPC timeout: same outcome on every Python version
+        if not in_time:
             return "no-answer"
         if isinstance(accepted, str):
             return accepted
-        try:
-            return await asyncio.wait_for(self._setup_outgoing(session, accepted), self.settings.kai_call_setup_timeout)
-        except asyncio.TimeoutError:
+        # An RPC TimeoutError from setup propagates: "Outgoing setup failed: TimeoutError".
+        in_time, result = await _within(self._setup_outgoing(session, accepted), self.settings.kai_call_setup_timeout)
+        if not in_time:
             self._log.warning("Outgoing setup timed out after answer (%.0f s).", self.settings.kai_call_setup_timeout)
             return "failed"
+        return result
 
     async def _ring_outgoing(self, session: CallSession):
         assert self.app is not None and self.ntg is not None
@@ -575,13 +585,14 @@ class TelegentApp:
     def _make_stop(self, user_id: int):
         async def stop() -> None:
             session = self.sessions.get(user_id)
-            if self.ntg is not None:
-                try:
-                    await self.ntg.stop(user_id)
-                except Exception:  # noqa: BLE001
-                    pass
-            if self.sessions.get(user_id) is session:
-                self.sessions.pop(user_id, None)
+            try:
+                if self.ntg is not None:
+                    await asyncio.wait_for(self.ntg.stop(user_id), NTG_STOP_TIMEOUT)
+            except Exception:  # noqa: BLE001  a hanging native stop must not keep the session registered
+                pass
+            finally:
+                if self.sessions.get(user_id) is session:
+                    self.sessions.pop(user_id, None)
 
         return stop
 
@@ -604,8 +615,11 @@ class TelegentApp:
                         )
                     )
                     log.info("Panggilan diakhiri oleh AI (DiscardCall terkirim).")
-                except Exception:  # noqa: BLE001
-                    log.exception("Gagal mengirim DiscardCall.")
+                except Exception as exc:  # noqa: BLE001
+                    if session.outgoing:
+                        log.warning("Gagal mengirim DiscardCall: %s", error_label(exc))
+                    else:
+                        log.exception("Gagal mengirim DiscardCall.")
             await session.close()
 
         return hangup

@@ -84,6 +84,7 @@ class CallSession:
         self._settings = settings
         self._log = logger
         self._on_stop = on_stop
+        self._stop_task: asyncio.Future | None = None
         self.outgoing = opening_text is not None
         # Outgoing calls are seeded by spool text: keep state changes, tool names
         # and error classes in the log, never transcripts, tool arguments/results
@@ -280,13 +281,20 @@ class CallSession:
     async def _stop_media(self) -> None:
         if self._on_stop is None:
             return
-        stop = asyncio.ensure_future(self._on_stop())
+        stop = self._stop_task = asyncio.ensure_future(self._on_stop())  # strong reference
         try:
             await asyncio.shield(stop)
         except asyncio.CancelledError:
-            raise  # the shielded stop still finishes and unregisters the session
+            # The shielded stop still finishes and unregisters the session; retrieve its late error.
+            stop.add_done_callback(self._log_late_stop_error)
+            raise
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Gagal menghentikan media: %s", self._reason(exc))
+
+    def _log_late_stop_error(self, task: asyncio.Future) -> None:
+        error = None if task.cancelled() else task.exception()
+        if error is not None:
+            self._log.warning("Gagal menghentikan media: %s", self._reason(error))
 
     # --------------------------------------------------------------- workers
     async def _gemini_sender_worker(self) -> None:
@@ -384,6 +392,7 @@ class CallSession:
             interval=0.010,
             prefill_frames=15,
             logger=self._log,
+            reason=self._reason,
         )
 
     # --------------------------------------------------------------- input media
@@ -494,7 +503,10 @@ class CallSession:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                self._error("Gagal mengakhiri panggilan", exc)
+                if self.outgoing:
+                    self._error("Gagal mengakhiri panggilan", exc)
+                else:
+                    self._log.exception("Gagal mengakhiri panggilan.")  # incoming: unchanged since ee9ae4b
 
     # --------------------------------------------------------------- anti-idle
     def _note_caller_activity(self) -> None:

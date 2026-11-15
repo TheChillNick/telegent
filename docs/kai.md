@@ -100,19 +100,19 @@ handling as an incoming call. Its initial user turn marks the request as
 2–3 short Czech sentences ending with the question/decision needed. No request
 text is added to the system instruction or application log.
 
-Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages.
+Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages. Keep LOG_LEVEL=INFO: the websockets logger is capped at INFO, because at DEBUG it logs Gemini frames including transcript fragments.
 
 Completed JSON retains `text`, `priority`, `created` and adds `result`:
 `done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,
 `stale`, `not-whitelisted`, or `invalid`. The ring deadline starts at the attempt and ends at the answer; the setup deadline starts at the answer; the RequestCall RPC disables Pyrogram retries/FloodWait sleeping and
-uses a timeout no longer than 15 seconds or that deadline. If cancellation
+uses a timeout no longer than 15 seconds or that deadline. A RequestCall RPC timeout counts as `no-answer`. After the answer, an RPC timeout of the key exchange or ConfirmCall is `failed` with `Outgoing setup failed: TimeoutError`; only the setup deadline logs `Outgoing setup timed out after answer`. CI runs Python 3.10, 3.12 and 3.13. If cancellation
 occurs while that RPC is in flight, cleanup retains its response to discard a
 remotely created call; waiting for that response can extend local cleanup beyond
 the deadline. If Telegram never returns an ID, remote state is unknown (logged)
 and no redial is attempted. Invalid JSON produces a result without
 request text. `answered` means P2P setup completed and Gemini startup was
 scheduled, not proof that the entire announcement was heard. The host can forward
-unsuccessful attempts through `hz-tg`; no call is automatically redialed.
+unsuccessful attempts through `hz-tg`; no call is automatically redialed. A request whose text is not valid UTF-8 (e.g. a lone surrogate from a non-UTF-8 terminal) or whose JSON nests too deeply becomes `invalid` without request text and never blocks later requests.
 
 Offline tests cover caller handshake/duplicate updates, early acceptance,
 remote busy/decline/missed calls, timeout, cancellation, setup failure,

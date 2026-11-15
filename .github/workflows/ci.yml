@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -15,6 +19,7 @@ jobs:
         uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
+          python-version: ${{ matrix.python }}
 
       - name: Sync dependencies
         run: uv sync --frozen

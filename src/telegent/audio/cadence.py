@@ -44,6 +44,7 @@ async def run_cadence_sender(
     prefill_frames: int = 15,
     send: Optional[Callable[[bytes], Awaitable[None]]] = None,
     logger: Any = None,
+    reason: Optional[Callable[[BaseException], object]] = None,
 ) -> None:
     """Kirim frame ke `sink` pada cadence stabil; isi senyap bila antrean kosong.
 
@@ -77,4 +78,4 @@ async def run_cadence_sender(
             raise
         except Exception as exc:  # noqa: BLE001 - jangan matikan pengiriman karena 1 error
             if logger is not None:
-                logger.warning("Gagal mengirim frame audio: %s", exc)
+                logger.warning("Gagal mengirim frame audio: %s", reason(exc) if reason is not None else exc)

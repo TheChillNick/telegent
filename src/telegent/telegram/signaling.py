@@ -8,6 +8,8 @@ from typing import Any, Optional
 import ntgcalls
 from pyrogram.raw import functions, types
 
+from telegent.logging_setup import error_label
+
 
 def to_ntg_rtc_server(conn: Any) -> ntgcalls.RTCServer:
     """Konversi koneksi server Telegram ke objek RTCServer ntgcalls."""
@@ -83,7 +85,8 @@ class SignalingService:
                 if "CALL_NOT_ACTIVE" in str(exc) and attempt < attempts - 1:
                     await asyncio.sleep(0.2 * (attempt + 1))
                     continue
-                self._log.warning("Gagal mengirim signaling (call=%s): %s", session.call_id, exc)
+                reason = error_label(exc) if getattr(session, "outgoing", False) else exc
+                self._log.warning("Gagal mengirim signaling (call=%s): %s", session.call_id, reason)
                 return
 
     def dispatch(self, session: Any, data: bytes) -> None:
