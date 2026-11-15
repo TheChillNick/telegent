@@ -242,9 +242,11 @@ class CallSession:
         try:
             await self._close_tasks()
         finally:
-            # Always unregister, even if close() is cancelled while tasks die.
-            await self._stop_media()
-        self.set_state(SessionState.IDLE)
+            try:
+                # Always unregister, even if close() is cancelled while tasks die.
+                await self._stop_media()
+            finally:
+                self.set_state(SessionState.IDLE)
 
     async def _close_tasks(self) -> None:
         self.set_state(SessionState.ENDING)
@@ -260,19 +262,20 @@ class CallSession:
         cancellable = [task for task in self._tasks if task is not current]
         for task in cancellable:
             task.cancel()
-        if cancellable:
-            await asyncio.gather(*cancellable, return_exceptions=True)
-        self._tasks.clear()
+        try:
+            if cancellable:
+                await asyncio.gather(*cancellable, return_exceptions=True)
+        finally:
+            self._tasks.clear()
+            if self._live_task is not None and self._live_task is not current:
+                self._live_task.cancel()
+            if self._hangup_task is not None and self._hangup_task is not current:
+                self._hangup_task.cancel()
 
-        if self._live_task is not None and self._live_task is not current:
-            self._live_task.cancel()
-        if self._hangup_task is not None and self._hangup_task is not current:
-            self._hangup_task.cancel()
-
-        self._inbound_framer.clear()
-        self._outbound_framer.clear()
-        self.pending_signaling.clear()
-        self.flush_outbound()
+            self._inbound_framer.clear()
+            self._outbound_framer.clear()
+            self.pending_signaling.clear()
+            self.flush_outbound()
 
     async def _stop_media(self) -> None:
         if self._on_stop is None:
