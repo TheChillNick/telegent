@@ -93,7 +93,7 @@ class Outbox:
                 original = self._read(path)
                 data = self._request(original)
                 result = original.get('result', 'failed')
-                if result not in {'answered', 'declined', 'busy', 'no-answer', 'failed', 'not-whitelisted'}:
+                if not isinstance(result, str) or result not in {'answered', 'declined', 'busy', 'no-answer', 'failed', 'not-whitelisted'}:
                     result = 'failed'
             except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
                 data, result = {}, 'failed'

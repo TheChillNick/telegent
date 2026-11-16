@@ -9,6 +9,20 @@ from pyrogram.errors import RPCError
 
 _configured = False
 
+_RETRY_WITH_REASON = '[%s] Retrying "%s" due to: '
+
+
+class _RetryReasonFilter(logging.Filter):
+    """Pyrogram's retry line ends in str(exception); keep the line, drop the reason."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and record.msg.startswith(_RETRY_WITH_REASON) and isinstance(record.args, tuple):
+            record.msg, record.args = '[%s] Retrying "%s"', record.args[:2]
+        return True
+
+
+_RETRY_REASON_FILTER = _RetryReasonFilter()
+
 
 def configure_logging(level: str = "INFO") -> None:
     """Inisialisasi logging global (idempoten)."""
@@ -22,6 +36,8 @@ def configure_logging(level: str = "INFO") -> None:
     )
     # DEBUG in websockets would log Gemini frames, incl. transcript fragments.
     logging.getLogger("websockets").setLevel(max(logging.INFO, logging.getLogger().level))
+    # Pyrogram logs the exception message when it retries an RPC (Telegram error text, errno).
+    logging.getLogger("pyrogram.session.session").addFilter(_RETRY_REASON_FILTER)
     _configured = True
 
 

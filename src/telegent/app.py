@@ -49,7 +49,7 @@ async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
     return True, task.result()
 
 
-NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered anyway
+NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered, the user stays busy until the native stop ends
 
 
 class TelegentApp:
@@ -79,6 +79,8 @@ class TelegentApp:
         self._outgoing_accept: dict[int, asyncio.Future[Any]] = {}
         self._outgoing_ready = asyncio.Event()
         self._outgoing_ready.set()
+        # Native stops still running after NTG_STOP_TIMEOUT: the user stays busy until they end.
+        self._native_stops: dict[int, asyncio.Future[Any]] = {}
 
     # ---------------------------------------------------------------- lifecycle
     async def run(self) -> None:
@@ -285,10 +287,14 @@ class TelegentApp:
                                  max_per_hour=cfg.kai_call_max_per_hour, min_gap=cfg.kai_call_min_gap,
                                  stale_seconds=cfg.kai_call_stale_seconds, quiet_start=cfg.kai_call_quiet_start,
                                  quiet_end=cfg.kai_call_quiet_end, timezone_name=cfg.kai_call_timezone)
-                await box.process(active=bool(self.sessions))
+                await box.process(active=self._spool_busy())
             except Exception as exc:
                 self._log.warning("Outgoing spool unavailable; no call attempted/retried: %s", error_label(exc))
             await asyncio.sleep(1)
+
+    def _spool_busy(self) -> bool:
+        """A live session, or a native stop still running, keeps queued requests waiting."""
+        return bool(self.sessions or self._native_stops)
 
     @staticmethod
     def _outcome(session: CallSession, result: str) -> None:
@@ -301,7 +307,7 @@ class TelegentApp:
         user_id = self.settings.kai_call_user_id
         if user_id <= 0 or user_id not in self.settings.allowed_user_id_set:
             return "not-whitelisted"
-        if self.sessions:
+        if self.sessions or user_id in self._native_stops:
             # Normally prevented by the spool. No await separates its activity
             # check and this reservation, so incoming calls cannot race it.
             return "busy"
@@ -458,7 +464,7 @@ class TelegentApp:
             await self._discard_call(call, types.PhoneCallDiscardReasonBusy(), user_id)
             return
 
-        if user_id in self.sessions:
+        if user_id in self.sessions or user_id in self._native_stops:
             # Panggilan ganda dari user yang sama (mis. update terduplikasi):
             # tolak yang baru agar sesi lama tidak tertimpa/bocor.
             log.warning("Ditolak: sudah ada sesi aktif untuk user ini.")
@@ -587,7 +593,12 @@ class TelegentApp:
             session = self.sessions.get(user_id)
             try:
                 if self.ntg is not None:
-                    await asyncio.wait_for(self.ntg.stop(user_id), NTG_STOP_TIMEOUT)
+                    native = asyncio.ensure_future(self.ntg.stop(user_id))
+                    try:
+                        await asyncio.wait_for(asyncio.shield(native), NTG_STOP_TIMEOUT)
+                    finally:
+                        if not native.done():  # timed out or cancelled: the native stop goes on
+                            self._track_native_stop(user_id, native)
             except Exception:  # noqa: BLE001  a hanging native stop must not keep the session registered
                 pass
             finally:
@@ -595,6 +606,19 @@ class TelegentApp:
                     self.sessions.pop(user_id, None)
 
         return stop
+
+    def _track_native_stop(self, user_id: int, native: asyncio.Future[Any]) -> None:
+        self._log.warning("Native media stop for user=%s still running after %.0f s; user stays busy.",
+                          user_id, NTG_STOP_TIMEOUT)
+        self._native_stops[user_id] = native
+
+        def done(future: asyncio.Future[Any]) -> None:
+            if self._native_stops.get(user_id) is future:
+                del self._native_stops[user_id]
+            if not future.cancelled():
+                future.exception()  # retrieved: asyncio never logs its text
+
+        native.add_done_callback(done)
 
     def _make_hangup(self, session: "CallSession"):
         """Callback untuk mengakhiri panggilan dari sisi AI (tool end_call)."""
