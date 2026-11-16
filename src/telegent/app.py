@@ -591,16 +591,18 @@ class TelegentApp:
     def _make_stop(self, user_id: int):
         async def stop() -> None:
             session = self.sessions.get(user_id)
+            started: asyncio.Future[Any] | None = None
             try:
                 if self.ntg is not None:
-                    native = asyncio.ensure_future(self.ntg.stop(user_id))
+                    native = started = asyncio.ensure_future(self.ntg.stop(user_id))
                     try:
                         await asyncio.wait_for(asyncio.shield(native), NTG_STOP_TIMEOUT)
                     finally:
                         if not native.done():  # timed out or cancelled: the native stop goes on
                             self._track_native_stop(user_id, native)
-            except Exception:  # noqa: BLE001  a hanging native stop must not keep the session registered
-                pass
+            except Exception as exc:  # noqa: BLE001  a failing native stop must not keep the session registered
+                if started is None or started.done():  # a still-running stop was logged by _track_native_stop
+                    self._log.warning("Native media stop failed: %s", error_label(exc))
             finally:
                 if self.sessions.get(user_id) is session:
                     self.sessions.pop(user_id, None)
