@@ -86,13 +86,14 @@ async def test_p04_requestcall_in_flight_then_error_logs_label_only(monkeypatch,
     assert not discards(invoked) and not app.sessions
 
 
-async def test_p05_requestcall_rpc_timeout_result(monkeypatch, caplog):
+@pytest.mark.parametrize('timeout_error', [TimeoutError, asyncio.TimeoutError], ids=['builtin', 'asyncio'])
+async def test_p05_requestcall_rpc_timeout_result(monkeypatch, caplog, timeout_error):
     """Pyrogram raises builtin TimeoutError('Request timed out') with retries=0.
-    asyncio.TimeoutError is builtin TimeoutError only on 3.11+."""
+    asyncio.TimeoutError is builtin TimeoutError only on 3.11+; on 3.10 both must give no-answer."""
     app, _, invoked, _ = setup_app(monkeypatch)
 
     async def rpc_timeout(query, original, **kw):
-        raise TimeoutError('Request timed out')
+        raise timeout_error('Request timed out')
 
     patch_invoke(app, functions.phone.RequestCall, rpc_timeout)
     caplog.set_level(logging.DEBUG)
