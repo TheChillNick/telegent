@@ -127,7 +127,10 @@ class TelegentApp:
             except Exception as exc:
                 self._log.warning("Outgoing watcher failed (%s); continuing shutdown.", error_label(exc))
         if self._late_discards:
-            await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
+            _, late = await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
+            if late:
+                self._log.warning("Ring discard not sent for %d call(s): no RequestCall id within %.0f s of the stop; "
+                                  "the phone may ring until Telegram ends the call.", len(late), LATE_DISCARD_TIMEOUT)
         if self._native_stops:
             # Not awaited: the ntgcalls Future may never end (MOU-470 P11: harmless with the real binding).
             self._log.info("Native media stop still running for %d user(s); not awaited.", len(self._native_stops))

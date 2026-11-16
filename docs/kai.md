@@ -74,11 +74,12 @@ Until the native stop ends, queued requests wait (none is dialled) and an incomi
 call from that user is discarded as busy (`Rejected: the previous call's native media
 stop is still running for this user.`). If it never ends, there is no further log line:
 queued requests become `stale` (the host forwards each one), and telegent must be
-restarted. A native stop that fails logs `Native media stop failed: <Class>`.
+restarted. A native stop that fails within the 10 s logs `Native media stop failed: <Class>`;
+a failure after the 10 s only ends the wait (no line).
 A directory, FIFO, socket or device named `*.json` in the spool or in `processing/` is
 skipped and left in place, never opened; telegent logs `Outgoing spool: skipped a
 non-regular entry (<kind>); left in place` once per kind (never the name). A symlink is
-refused as `invalid`.
+refused as `invalid` (in `processing/`: `failed`).
 
 | Environment | Default | Meaning |
 | --- | --- | --- |
@@ -121,9 +122,13 @@ Completed JSON retains `text`, `priority`, `created` and adds `result`:
 uses a timeout no longer than 15 seconds or that deadline. A RequestCall RPC timeout counts as `no-answer`. After the answer, an RPC timeout of the key exchange or ConfirmCall is `failed` with `Outgoing setup failed: TimeoutError`; only the setup deadline logs `Outgoing setup timed out after answer`. CI runs Python 3.10, 3.12 and 3.13. If cancellation
 occurs while that RPC is in flight, cleanup retains its response to discard a
 remotely created call; waiting for that response can extend local cleanup beyond
-the deadline. If telegent itself is stopped during that wait, it waits up to 5 s
-more for the ID and then discards the call (Missed), so the phone stops ringing; at
-stop it also logs how many native media stops are still running (not awaited).
+the deadline. A stop of telegent that interrupts the RequestCall itself waits for
+that response (at most the RPC timeout, 15 s), which can exceed Docker's 10 s stop
+grace on a slow Telegram. If telegent is stopped while cleanup after the ring
+deadline is already waiting, it waits up to 5 s more for the ID and then discards the
+call (Missed), so the phone stops ringing; an ID that comes later is lost and logged
+as `Ring discard not sent for 1 call(s) …` (the phone may ring until Telegram ends the
+call). At stop it also logs how many native media stops are still running (not awaited).
 If Telegram never returns an ID, remote state is unknown (logged)
 and no redial is attempted. Invalid JSON produces a result without
 request text. `answered` means P2P setup completed and Gemini startup was
