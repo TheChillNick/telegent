@@ -140,9 +140,9 @@ async def test_hanging_discard_rpc_is_bounded_and_logged(monkeypatch, caplog):
     await asyncio.wait_for(app._shutdown(), 2)
     elapsed = loop.time() - started
     assert 0.15 < elapsed < 0.6, elapsed  # id at ~0.05 s, then the 0.2 s RPC bound; never the id bound + more
-    assert warnings(caplog) == [
+    assert warnings(caplog) in ([
         'Ring discard not confirmed for 1 call(s): DiscardCall still running 0 s after the id; '
-        'the phone may ring until Telegram ends the call.']
+        'the phone may ring until Telegram ends the call.'], ['Discard failed for user=7: TimeoutError'])
     assert 'SECRET' not in caplog.text
     app.app.stop.assert_awaited_once()
     await cancel_leftovers(app)
@@ -176,7 +176,7 @@ async def test_discard_during_the_stop_is_one_bounded_try(monkeypatch):
             break
         await asyncio.sleep(0.01)
     await asyncio.wait_for(app._shutdown(), 2)
-    assert kwargs == [{'retries': 0, 'timeout': app_module.STOP_DISCARD_TIMEOUT}]
+    assert kwargs == [{'retries': 0, 'timeout': app_module.STOP_DISCARD_TIMEOUT, 'sleep_threshold': 0}]
     assert app_module.STOP_DISCARD_TIMEOUT == 2.0
 
 
@@ -193,3 +193,44 @@ async def test_discard_outside_the_stop_keeps_pyrogram_defaults(monkeypatch):
     await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
                                                      g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
     assert kwargs == [{}]
+
+
+async def test_stop_while_ringing_bounds_invoke_before_send(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.2)
+    app, _, _, _ = setup_app(monkeypatch)
+    app.app.stop = AsyncMock()
+    async def hang(query, original, **kw):
+        await asyncio.Event().wait()
+    patch_invoke(app, functions.phone.DiscardCall, hang)
+    app._outbox_task = asyncio.create_task(app._call_outgoing('x'))
+    while not (app.sessions.get(7) and app.sessions[7].call_id == 10):
+        await asyncio.sleep(0.01)
+    start = asyncio.get_running_loop().time()
+    await asyncio.wait_for(app._shutdown(), 1)
+    assert asyncio.get_running_loop().time() - start <= 0.3
+    assert 'Discard failed for user=7: TimeoutError' in caplog.text
+
+
+async def test_stop_floodwait_does_not_sleep_or_retry(monkeypatch, caplog):
+    from pyrogram.session import Session
+    from pyrogram.errors import FloodWait
+    from types import SimpleNamespace
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.2)
+    app, _, _, _ = setup_app(monkeypatch)
+    app.app.stop = AsyncMock()
+    sends = []
+    async def send(query, timeout):
+        sends.append(query)
+        raise FloodWait(value=1)
+    stub = SimpleNamespace(is_started=asyncio.Event(), WAIT_TIMEOUT=0.01, send=send, client=SimpleNamespace(name='test'))
+    async def invoke(query, original, **kw):
+        return await Session.invoke(stub, query, **kw)
+    patch_invoke(app, functions.phone.DiscardCall, invoke)
+    app._outbox_task = asyncio.create_task(app._call_outgoing('x'))
+    while not (app.sessions.get(7) and app.sessions[7].call_id == 10):
+        await asyncio.sleep(0.01)
+    start = asyncio.get_running_loop().time()
+    await asyncio.wait_for(app._shutdown(), 1)
+    assert asyncio.get_running_loop().time() - start <= 0.3
+    assert len(sends) == 1
+    assert 'Discard failed for user=7: FloodWait' in caplog.text

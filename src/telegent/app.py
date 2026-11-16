@@ -632,14 +632,18 @@ class TelegentApp:
             return
         peer = types.InputPhoneCall(id=getattr(call, "call_id", None) or call.id, access_hash=call.access_hash)
         # During the app stop: one try, STOP_DISCARD_TIMEOUT (Pyrogram's default is 15 s x 10 retries).
-        bound: dict[str, Any] = {"retries": 0, "timeout": STOP_DISCARD_TIMEOUT} if self._stop.is_set() else {}
+        bound: dict[str, Any] = {"retries": 0, "timeout": STOP_DISCARD_TIMEOUT, "sleep_threshold": 0} if self._stop.is_set() else {}
         try:
-            await self.app.invoke(
+            invocation = self.app.invoke(
                 functions.phone.DiscardCall(
                     peer=peer, duration=0, reason=reason, connection_id=0  # pyright: ignore[reportArgumentType]
                 ),
                 **bound,
             )
+            if self._stop.is_set():
+                await asyncio.wait_for(invocation, STOP_DISCARD_TIMEOUT)
+            else:
+                await invocation
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Discard failed for user=%s: %s", user_id, error_label(exc))
 

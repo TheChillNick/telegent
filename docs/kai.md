@@ -126,7 +126,7 @@ the deadline. If telegent is stopped while the RequestCall is in flight (also wh
 cleanup after the ring deadline waits for it), the stop waits up to 5 s for the ID and
 then discards the call (Missed), so the phone stops ringing; an ID that comes later is
 lost and logged as `Ring discard not sent for 1 call(s) …` (the phone may ring until
-Telegram ends the call). During the stop every DiscardCall is one try of at most 2 s;
+Telegram ends the call). During the stop every DiscardCall is one try of at most 2 s, including reconnect waits and FloodWait handling;
 a late discard still running after that logs `Ring discard not confirmed for 1 call(s) …`.
 The stop so takes at most about 7 s plus the client stop, or 2 s plus the 10 s native
 media stop when that hangs; the deploy compose sets `stop_grace_period: 25s`.
