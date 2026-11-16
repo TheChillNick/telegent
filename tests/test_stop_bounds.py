@@ -234,3 +234,17 @@ async def test_stop_floodwait_does_not_sleep_or_retry(monkeypatch, caplog):
     assert asyncio.get_running_loop().time() - start <= 0.3
     assert len(sends) == 1
     assert 'Discard failed for user=7: FloodWait' in caplog.text
+
+
+async def test_discard_outside_stop_has_no_outer_deadline(monkeypatch):
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.05)
+    app, _, _, _ = setup_app(monkeypatch)
+    completed = []
+    async def slow(query, original, **kw):
+        await asyncio.sleep(0.1)
+        completed.append(True)
+        return await original(query, **kw)
+    patch_invoke(app, functions.phone.DiscardCall, slow)
+    await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
+                                                     g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
+    assert completed == [True]
