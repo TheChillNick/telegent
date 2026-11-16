@@ -49,6 +49,7 @@ async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
     return True, task.result()
 
 
+LATE_DISCARD_TIMEOUT = 5.0  # seconds the app stop waits for a late RequestCall id to discard
 NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered, the user stays busy until the native stop ends
 
 
@@ -81,6 +82,8 @@ class TelegentApp:
         self._outgoing_ready.set()
         # Native stops still running after NTG_STOP_TIMEOUT: the user stays busy until they end.
         self._native_stops: dict[int, asyncio.Future[Any]] = {}
+        # RequestCalls cancelled twice during ring cleanup: discard the remote call once the id arrives.
+        self._late_discards: set[asyncio.Task[None]] = set()
 
     # ---------------------------------------------------------------- lifecycle
     async def run(self) -> None:
@@ -123,6 +126,11 @@ class TelegentApp:
                 pass
             except Exception as exc:
                 self._log.warning("Outgoing watcher failed (%s); continuing shutdown.", error_label(exc))
+        if self._late_discards:
+            await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
+        if self._native_stops:
+            # Not awaited: the ntgcalls Future may never end (MOU-470 P11: harmless with the real binding).
+            self._log.info("Native media stop still running for %d user(s); not awaited.", len(self._native_stops))
         self._log.info("Mematikan; menutup %d sesi aktif.", len(self.sessions))
         for session in list(self.sessions.values()):
             await session.close()
@@ -389,9 +397,13 @@ class TelegentApp:
                 # can discard the remote call, including during shutdown. This
                 # can extend local cleanup beyond the ring deadline by RPC latency.
                 try:
-                    response = await request
+                    response = await asyncio.shield(request)
                     call = response.phone_call
                     session.call_id, session.access_hash = call.id, call.access_hash
+                except asyncio.CancelledError:
+                    # Cancelled again (app stop): the id may still arrive; discard the call then.
+                    self._discard_when_known(request, user_id)
+                    raise
                 except Exception as exc:
                     self._log.warning("RequestCall response unavailable; remote state unknown: %s", error_label(exc))
                 raise
@@ -461,6 +473,11 @@ class TelegentApp:
                 self.settings.max_calls_per_window,
                 self.settings.call_window_seconds,
             )
+            await self._discard_call(call, types.PhoneCallDiscardReasonBusy(), user_id)
+            return
+
+        if user_id in self._native_stops and user_id not in self.sessions:
+            log.warning("Rejected: the previous call's native media stop is still running for this user.")
             await self._discard_call(call, types.PhoneCallDiscardReasonBusy(), user_id)
             return
 
@@ -575,6 +592,19 @@ class TelegentApp:
         call_logger(session.user_id, session.call_id).info("Panggilan berakhir.")
         await session.close()
 
+    def _discard_when_known(self, request: asyncio.Future[Any], user_id: int) -> None:
+        async def discard() -> None:
+            try:
+                response = await request
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("RequestCall response unavailable; remote state unknown: %s", error_label(exc))
+                return
+            await self._discard_call(response.phone_call, types.PhoneCallDiscardReasonMissed(), user_id)
+
+        task = asyncio.ensure_future(discard())
+        self._late_discards.add(task)
+        task.add_done_callback(self._late_discards.discard)
+
     async def _discard_call(self, call, reason, user_id: int) -> None:
         if self.app is None:
             return
@@ -591,25 +621,35 @@ class TelegentApp:
     def _make_stop(self, user_id: int):
         async def stop() -> None:
             session = self.sessions.get(user_id)
+            started: asyncio.Future[Any] | None = None
             try:
                 if self.ntg is not None:
-                    native = asyncio.ensure_future(self.ntg.stop(user_id))
+                    native = started = asyncio.ensure_future(self.ntg.stop(user_id))
+                    timed_out = False
                     try:
                         await asyncio.wait_for(asyncio.shield(native), NTG_STOP_TIMEOUT)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        timed_out = True
+                        raise
                     finally:
                         if not native.done():  # timed out or cancelled: the native stop goes on
-                            self._track_native_stop(user_id, native)
-            except Exception:  # noqa: BLE001  a hanging native stop must not keep the session registered
-                pass
+                            self._track_native_stop(user_id, native, timed_out=timed_out)
+            except Exception as exc:  # noqa: BLE001  a failing native stop must not keep the session registered
+                if started is None or started.done():  # a still-running stop was logged by _track_native_stop
+                    self._log.warning("Native media stop failed: %s", error_label(exc))
             finally:
                 if self.sessions.get(user_id) is session:
                     self.sessions.pop(user_id, None)
 
         return stop
 
-    def _track_native_stop(self, user_id: int, native: asyncio.Future[Any]) -> None:
-        self._log.warning("Native media stop for user=%s still running after %.0f s; user stays busy.",
-                          user_id, NTG_STOP_TIMEOUT)
+    def _track_native_stop(self, user_id: int, native: asyncio.Future[Any], *, timed_out: bool = True) -> None:
+        if timed_out:
+            self._log.warning("Native media stop for user=%s still running after %.0f s; user stays busy.",
+                              user_id, NTG_STOP_TIMEOUT)
+        else:
+            self._log.warning("Native media stop for user=%s still running after its wait was cancelled; "
+                              "user stays busy.", user_id)
         self._native_stops[user_id] = native
 
         def done(future: asyncio.Future[Any]) -> None:
