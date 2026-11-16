@@ -66,6 +66,19 @@ Files wait while any incoming/outgoing call is present, during quiet hours, or
 when the rate budget is exhausted. Requests older than the stale limit become
 `failed/` results even if they were waiting for another call. Urgent requests
 bypass quiet hours only, never the whitelist, active-call check or rate limits.
+When a call ends, telegent waits at most 10 s for ntgcalls to stop the media, then
+unregisters the session. If the native stop is still running, it logs one WARNING
+`Native media stop for user=<id> still running after 10 s; user stays busy.` (after a
+cancelled wait: `... still running after its wait was cancelled; user stays busy.`).
+Until the native stop ends, queued requests wait (none is dialled) and an incoming
+call from that user is discarded as busy (`Rejected: the previous call's native media
+stop is still running for this user.`). If it never ends, there is no further log line:
+queued requests become `stale` (the host forwards each one), and telegent must be
+restarted. A native stop that fails logs `Native media stop failed: <Class>`.
+A directory, FIFO, socket or device named `*.json` in the spool or in `processing/` is
+skipped and left in place, never opened; telegent logs `Outgoing spool: skipped a
+non-regular entry (<kind>); left in place` once per kind (never the name). A symlink is
+refused as `invalid`.
 
 | Environment | Default | Meaning |
 | --- | --- | --- |
@@ -100,7 +113,7 @@ handling as an incoming call. Its initial user turn marks the request as
 2–3 short Czech sentences ending with the question/decision needed. No request
 text is added to the system instruction or application log.
 
-Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages. Keep LOG_LEVEL=INFO: the websockets logger is capped at INFO, because at DEBUG it logs Gemini frames including transcript fragments.
+Outgoing calls log state changes, registered tool names and error classes with the Telegram RPC error id; never the request text, transcripts, tool arguments/results or exception messages. Pyrogram's retry line keeps the RPC name only, and its transport lines (`Send exception`, `Close exception`, `Unable to connect due to network issues`) keep the exception class only. Keep LOG_LEVEL=INFO: the websockets logger is capped at INFO, because at DEBUG it logs Gemini frames including transcript fragments.
 
 Completed JSON retains `text`, `priority`, `created` and adds `result`:
 `done/` for `answered`; `failed/` for `no-answer`, `declined`, `busy`, `failed`,
@@ -108,7 +121,10 @@ Completed JSON retains `text`, `priority`, `created` and adds `result`:
 uses a timeout no longer than 15 seconds or that deadline. A RequestCall RPC timeout counts as `no-answer`. After the answer, an RPC timeout of the key exchange or ConfirmCall is `failed` with `Outgoing setup failed: TimeoutError`; only the setup deadline logs `Outgoing setup timed out after answer`. CI runs Python 3.10, 3.12 and 3.13. If cancellation
 occurs while that RPC is in flight, cleanup retains its response to discard a
 remotely created call; waiting for that response can extend local cleanup beyond
-the deadline. If Telegram never returns an ID, remote state is unknown (logged)
+the deadline. If telegent itself is stopped during that wait, it waits up to 5 s
+more for the ID and then discards the call (Missed), so the phone stops ringing; at
+stop it also logs how many native media stops are still running (not awaited).
+If Telegram never returns an ID, remote state is unknown (logged)
 and no redial is attempted. Invalid JSON produces a result without
 request text. `answered` means P2P setup completed and Gemini startup was
 scheduled, not proof that the entire announcement was heard. The host can forward
@@ -117,7 +133,9 @@ unsuccessful attempts through `hz-tg`; no call is automatically redialed. A requ
 Offline tests cover caller handshake/duplicate updates, early acceptance,
 remote busy/decline/missed calls, timeout, cancellation, setup failure,
 whitelist refusal, active-call queueing, normal/urgent quiet hours, stale/invalid
-requests, capped text, and persistent rate limits. **No real Telegram/Gemini call
+requests, capped text, persistent rate limits, a slow native media stop (queued
+request waits, incoming call busy, late error retrieved), non-regular spool entries,
+a stop during ring cleanup, and Pyrogram retry/transport log lines without exception text. **No real Telegram/Gemini call
 has been made for this change.** After review and a separately authorized deploy,
 Claude/Atlas and Štěpán still need to verify ringing, speech, bidirectional audio,
 tools/events, decline/timeout and host fallback on the real account. Automatic
