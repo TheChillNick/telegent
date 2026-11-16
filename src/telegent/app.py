@@ -50,6 +50,7 @@ async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
 
 
 LATE_DISCARD_TIMEOUT = 5.0  # seconds the app stop waits for a late RequestCall id to discard
+STOP_DISCARD_TIMEOUT = 2.0  # seconds one DiscardCall may take during the app stop (no Pyrogram retries)
 NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered, the user stays busy until the native stop ends
 
 
@@ -82,8 +83,8 @@ class TelegentApp:
         self._outgoing_ready.set()
         # Native stops still running after NTG_STOP_TIMEOUT: the user stays busy until they end.
         self._native_stops: dict[int, asyncio.Future[Any]] = {}
-        # RequestCalls cancelled twice during ring cleanup: discard the remote call once the id arrives.
-        self._late_discards: set[asyncio.Task[None]] = set()
+        # RequestCalls interrupted by the app stop (also after the ring deadline): discard once the id arrives.
+        self._late_discards: dict[asyncio.Task[None], asyncio.Future[Any]] = {}  # discard task -> its RequestCall
 
     # ---------------------------------------------------------------- lifecycle
     async def run(self) -> None:
@@ -118,6 +119,7 @@ class TelegentApp:
             await self._shutdown()
 
     async def _shutdown(self) -> None:
+        self._stop.set()  # an in-flight RequestCall hands its id to _discard_when_known instead of waiting
         if self._outbox_task is not None:
             self._outbox_task.cancel()
             try:
@@ -127,10 +129,7 @@ class TelegentApp:
             except Exception as exc:
                 self._log.warning("Outgoing watcher failed (%s); continuing shutdown.", error_label(exc))
         if self._late_discards:
-            _, late = await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
-            if late:
-                self._log.warning("Ring discard not sent for %d call(s): no RequestCall id within %.0f s of the stop; "
-                                  "the phone may ring until Telegram ends the call.", len(late), LATE_DISCARD_TIMEOUT)
+            await self._finish_late_discards()
         if self._native_stops:
             # Not awaited: the ntgcalls Future may never end (MOU-470 P11: harmless with the real binding).
             self._log.info("Native media stop still running for %d user(s); not awaited.", len(self._native_stops))
@@ -142,7 +141,22 @@ class TelegentApp:
             try:
                 await self.app.stop()
             except Exception as exc:  # noqa: BLE001
-                self._log.warning("Gagal menutup klien Telegram: %s", exc)
+                self._log.warning("Gagal menutup klien Telegram: %s", error_label(exc))
+
+    async def _finish_late_discards(self) -> None:
+        """Wait at most LATE_DISCARD_TIMEOUT for the ids, then STOP_DISCARD_TIMEOUT for their DiscardCalls."""
+        pending = dict(self._late_discards)
+        await asyncio.wait(set(pending.values()), timeout=LATE_DISCARD_TIMEOUT)
+        no_id = [task for task, request in pending.items() if not request.done()]
+        sending = {task for task, request in pending.items() if request.done() and not task.done()}
+        if sending:
+            _, sending = await asyncio.wait(sending, timeout=STOP_DISCARD_TIMEOUT)
+        if no_id:
+            self._log.warning("Ring discard not sent for %d call(s): no RequestCall id within %.0f s of the stop; "
+                              "the phone may ring until Telegram ends the call.", len(no_id), LATE_DISCARD_TIMEOUT)
+        if sending:
+            self._log.warning("Ring discard not confirmed for %d call(s): DiscardCall still running %.0f s after the id; "
+                              "the phone may ring until Telegram ends the call.", len(sending), STOP_DISCARD_TIMEOUT)
 
     def _install_signal_handlers(self) -> None:
         assert self.loop is not None
@@ -396,6 +410,11 @@ class TelegentApp:
             try:
                 response = await asyncio.shield(request)
             except asyncio.CancelledError:
+                if self._stop.is_set() and not request.done():
+                    # App stop during the RequestCall itself: do not wait up to the 15 s RPC timeout here
+                    # (Docker's grace is 10 s); the app stop waits at most LATE_DISCARD_TIMEOUT for the id.
+                    self._discard_when_known(request, user_id)
+                    raise
                 # Telegram may already be ringing. Keep its response so cleanup
                 # can discard the remote call, including during shutdown. This
                 # can extend local cleanup beyond the ring deadline by RPC latency.
@@ -605,18 +624,21 @@ class TelegentApp:
             await self._discard_call(response.phone_call, types.PhoneCallDiscardReasonMissed(), user_id)
 
         task = asyncio.ensure_future(discard())
-        self._late_discards.add(task)
-        task.add_done_callback(self._late_discards.discard)
+        self._late_discards[task] = request
+        task.add_done_callback(lambda done: self._late_discards.pop(done, None))
 
     async def _discard_call(self, call, reason, user_id: int) -> None:
         if self.app is None:
             return
         peer = types.InputPhoneCall(id=getattr(call, "call_id", None) or call.id, access_hash=call.access_hash)
+        # During the app stop: one try, STOP_DISCARD_TIMEOUT (Pyrogram's default is 15 s x 10 retries).
+        bound: dict[str, Any] = {"retries": 0, "timeout": STOP_DISCARD_TIMEOUT} if self._stop.is_set() else {}
         try:
             await self.app.invoke(
                 functions.phone.DiscardCall(
                     peer=peer, duration=0, reason=reason, connection_id=0  # pyright: ignore[reportArgumentType]
-                )
+                ),
+                **bound,
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Discard failed for user=%s: %s", user_id, error_label(exc))
