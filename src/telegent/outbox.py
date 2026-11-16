@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import os
+import stat
 import tempfile
 import logging
 from datetime import datetime, timezone
@@ -13,6 +14,9 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
+
+_KINDS = ((stat.S_ISDIR, 'directory'), (stat.S_ISFIFO, 'fifo'), (stat.S_ISSOCK, 'socket'),
+          (stat.S_ISCHR, 'device'), (stat.S_ISBLK, 'device'))
 
 
 def write_private(path: Path, data: Any) -> None:
@@ -45,11 +49,31 @@ class Outbox:
         for path in (self.directory, *(self.directory / x for x in ('processing', 'done', 'failed'))):
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.journal = self.directory / '.attempts.json'
+        self._skipped_kinds: set[str] = set()
+
+    def _skip(self, path: Path) -> bool:
+        """True for an entry that must never be opened (directory, FIFO, socket, device) or that vanished.
+
+        Symlinks are not skipped: _read refuses them (O_NOFOLLOW) and they end as invalid/failed.
+        """
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return True  # vanished between glob and lstat
+        if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+            return False
+        kind = next((name for test, name in _KINDS if test(mode)), 'other')
+        if kind not in self._skipped_kinds:
+            self._skipped_kinds.add(kind)
+            # The kind only: never the entry name (kai-call names can carry request data).
+            log.warning('Outgoing spool: skipped a non-regular entry (%s); left in place', kind)
+        return True
 
     @staticmethod
     def _read(path: Path) -> dict[str, Any]:
         # Bound memory and never follow a request symlink outside the spool.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a FIFO swapped in after _skip() must not block the event loop.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, 'r', encoding='utf-8') as stream:
             raw = stream.read(65537)
         if len(raw) > 65536:
@@ -89,6 +113,8 @@ class Outbox:
         # Only one consumer owns the spool. Every pass reconciles claims left
         # behind by crashes or transient I/O errors, always without redialing.
         for path in sorted((self.directory / 'processing').glob('*.json')):
+            if self._skip(path):
+                continue
             try:
                 original = self._read(path)
                 data = self._request(original)
@@ -115,7 +141,7 @@ class Outbox:
         if self.quiet_start == self.quiet_end:
             quiet = False
         for path in sorted(self.directory.glob('*.json')):
-            if path.name.startswith('.'):
+            if path.name.startswith('.') or self._skip(path):
                 continue
             data: dict[str, Any] = {}
             try:
