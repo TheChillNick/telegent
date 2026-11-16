@@ -248,3 +248,18 @@ async def test_discard_outside_stop_has_no_outer_deadline(monkeypatch):
     await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
                                                      g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
     assert completed == [True]
+
+
+async def test_late_discard_fallback_wait_is_bounded_and_warns(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.1)
+    app, _, _, _ = setup_app(monkeypatch)
+    request = asyncio.get_running_loop().create_future()
+    request.set_result(None)
+    task = asyncio.create_task(asyncio.Event().wait())
+    app._late_discards[task] = request
+    start = asyncio.get_running_loop().time()
+    await asyncio.wait_for(app._finish_late_discards(), 0.5)
+    assert asyncio.get_running_loop().time() - start <= 0.2
+    assert 'Ring discard not confirmed for 1 call(s)' in caplog.text
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
