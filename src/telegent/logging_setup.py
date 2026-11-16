@@ -23,6 +23,29 @@ class _RetryReasonFilter(logging.Filter):
 
 _RETRY_REASON_FILTER = _RetryReasonFilter()
 
+# Pyrogram 2.0.106 transport lines that end in str(exception) (OS socket text, DC address).
+_TRANSPORT_LOGGERS = ("pyrogram.connection.transport.tcp.tcp", "pyrogram.connection.connection")
+_DROP_TEXT = {
+    "Send exception: %s %s": "Send exception: %s",  # tcp.py:103, args (class name, exc)
+    "Close exception: %s %s": "Close exception: %s",  # tcp.py:94, args (class name, exc)
+}
+_CONNECT_FAILED = "Unable to connect due to network issues: %s"  # connection.py:50, args (exc,)
+
+
+class _TransportTextFilter(logging.Filter):
+    """Keep Pyrogram's transport lines and the exception class, drop the exception text."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and isinstance(record.args, tuple) and record.args:
+            if record.msg in _DROP_TEXT:
+                record.msg, record.args = _DROP_TEXT[record.msg], record.args[:1]
+            elif record.msg == _CONNECT_FAILED:
+                record.args = (type(record.args[0]).__name__,)
+        return True
+
+
+_TRANSPORT_TEXT_FILTER = _TransportTextFilter()
+
 
 def configure_logging(level: str = "INFO") -> None:
     """Inisialisasi logging global (idempoten)."""
@@ -38,6 +61,8 @@ def configure_logging(level: str = "INFO") -> None:
     logging.getLogger("websockets").setLevel(max(logging.INFO, logging.getLogger().level))
     # Pyrogram logs the exception message when it retries an RPC (Telegram error text, errno).
     logging.getLogger("pyrogram.session.session").addFilter(_RETRY_REASON_FILTER)
+    for name in _TRANSPORT_LOGGERS:
+        logging.getLogger(name).addFilter(_TRANSPORT_TEXT_FILTER)
     _configured = True
 
 
