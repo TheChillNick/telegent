@@ -49,6 +49,7 @@ async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
     return True, task.result()
 
 
+LATE_DISCARD_TIMEOUT = 5.0  # seconds the app stop waits for a late RequestCall id to discard
 NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered, the user stays busy until the native stop ends
 
 
@@ -81,6 +82,8 @@ class TelegentApp:
         self._outgoing_ready.set()
         # Native stops still running after NTG_STOP_TIMEOUT: the user stays busy until they end.
         self._native_stops: dict[int, asyncio.Future[Any]] = {}
+        # RequestCalls cancelled twice during ring cleanup: discard the remote call once the id arrives.
+        self._late_discards: set[asyncio.Task[None]] = set()
 
     # ---------------------------------------------------------------- lifecycle
     async def run(self) -> None:
@@ -123,6 +126,8 @@ class TelegentApp:
                 pass
             except Exception as exc:
                 self._log.warning("Outgoing watcher failed (%s); continuing shutdown.", error_label(exc))
+        if self._late_discards:
+            await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
         self._log.info("Mematikan; menutup %d sesi aktif.", len(self.sessions))
         for session in list(self.sessions.values()):
             await session.close()
@@ -389,9 +394,13 @@ class TelegentApp:
                 # can discard the remote call, including during shutdown. This
                 # can extend local cleanup beyond the ring deadline by RPC latency.
                 try:
-                    response = await request
+                    response = await asyncio.shield(request)
                     call = response.phone_call
                     session.call_id, session.access_hash = call.id, call.access_hash
+                except asyncio.CancelledError:
+                    # Cancelled again (app stop): the id may still arrive; discard the call then.
+                    self._discard_when_known(request, user_id)
+                    raise
                 except Exception as exc:
                     self._log.warning("RequestCall response unavailable; remote state unknown: %s", error_label(exc))
                 raise
@@ -574,6 +583,19 @@ class TelegentApp:
         self._outcome(session, result)
         call_logger(session.user_id, session.call_id).info("Panggilan berakhir.")
         await session.close()
+
+    def _discard_when_known(self, request: asyncio.Future[Any], user_id: int) -> None:
+        async def discard() -> None:
+            try:
+                response = await request
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("RequestCall response unavailable; remote state unknown: %s", error_label(exc))
+                return
+            await self._discard_call(response.phone_call, types.PhoneCallDiscardReasonMissed(), user_id)
+
+        task = asyncio.ensure_future(discard())
+        self._late_discards.add(task)
+        task.add_done_callback(self._late_discards.discard)
 
     async def _discard_call(self, call, reason, user_id: int) -> None:
         if self.app is None:
