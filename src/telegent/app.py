@@ -128,6 +128,9 @@ class TelegentApp:
                 self._log.warning("Outgoing watcher failed (%s); continuing shutdown.", error_label(exc))
         if self._late_discards:
             await asyncio.wait(set(self._late_discards), timeout=LATE_DISCARD_TIMEOUT)
+        if self._native_stops:
+            # Not awaited: the ntgcalls Future may never end (MOU-470 P11: harmless with the real binding).
+            self._log.info("Native media stop still running for %d user(s); not awaited.", len(self._native_stops))
         self._log.info("Mematikan; menutup %d sesi aktif.", len(self.sessions))
         for session in list(self.sessions.values()):
             await session.close()
@@ -473,6 +476,11 @@ class TelegentApp:
             await self._discard_call(call, types.PhoneCallDiscardReasonBusy(), user_id)
             return
 
+        if user_id in self._native_stops and user_id not in self.sessions:
+            log.warning("Rejected: the previous call's native media stop is still running for this user.")
+            await self._discard_call(call, types.PhoneCallDiscardReasonBusy(), user_id)
+            return
+
         if user_id in self.sessions or user_id in self._native_stops:
             # Panggilan ganda dari user yang sama (mis. update terduplikasi):
             # tolak yang baru agar sesi lama tidak tertimpa/bocor.
@@ -617,11 +625,15 @@ class TelegentApp:
             try:
                 if self.ntg is not None:
                     native = started = asyncio.ensure_future(self.ntg.stop(user_id))
+                    timed_out = False
                     try:
                         await asyncio.wait_for(asyncio.shield(native), NTG_STOP_TIMEOUT)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        timed_out = True
+                        raise
                     finally:
                         if not native.done():  # timed out or cancelled: the native stop goes on
-                            self._track_native_stop(user_id, native)
+                            self._track_native_stop(user_id, native, timed_out=timed_out)
             except Exception as exc:  # noqa: BLE001  a failing native stop must not keep the session registered
                 if started is None or started.done():  # a still-running stop was logged by _track_native_stop
                     self._log.warning("Native media stop failed: %s", error_label(exc))
@@ -631,9 +643,13 @@ class TelegentApp:
 
         return stop
 
-    def _track_native_stop(self, user_id: int, native: asyncio.Future[Any]) -> None:
-        self._log.warning("Native media stop for user=%s still running after %.0f s; user stays busy.",
-                          user_id, NTG_STOP_TIMEOUT)
+    def _track_native_stop(self, user_id: int, native: asyncio.Future[Any], *, timed_out: bool = True) -> None:
+        if timed_out:
+            self._log.warning("Native media stop for user=%s still running after %.0f s; user stays busy.",
+                              user_id, NTG_STOP_TIMEOUT)
+        else:
+            self._log.warning("Native media stop for user=%s still running after its wait was cancelled; "
+                              "user stays busy.", user_id)
         self._native_stops[user_id] = native
 
         def done(future: asyncio.Future[Any]) -> None:
