@@ -646,6 +646,14 @@ class TelegentApp:
                 await invocation
         except Exception as exc:  # noqa: BLE001
             self._log.warning("Discard failed for user=%s: %s", user_id, error_label(exc))
+        except asyncio.CancelledError:
+            if self._stop.is_set():
+                self._log.warning("Discard interrupted for user=%s by the stop; the phone may ring until Telegram "
+                                  "ends the call.", user_id)
+            else:  # e.g. the setup deadline cancels the media-failure discard
+                self._log.warning("Discard interrupted for user=%s; the phone may ring until Telegram ends the call.",
+                                  user_id)
+            raise
 
     def _make_stop(self, user_id: int):
         async def stop() -> None:

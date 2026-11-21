@@ -9,11 +9,12 @@ import asyncio
 import logging
 from unittest.mock import AsyncMock
 
+import pytest
 from pyrogram.raw import functions, types
 
 import telegent.app as app_module
-from test_outgoing import setup_app
-from test_outgoing_deadlines import discards, patch_invoke
+from test_outgoing import setup_app, start_dial
+from test_outgoing_deadlines import accept, discards, patch_invoke
 from test_outgoing_gaps import slow_requestcall
 
 
@@ -282,3 +283,72 @@ async def test_stop_time_discard_timeout_cancels_the_invoke(monkeypatch):
     await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
                                                      g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
     assert seen == ['cancelled']
+
+
+async def test_discard_cancelled_by_the_stop_is_logged_and_reraised(monkeypatch, caplog):
+    """MOU-621 F1: a DiscardCall that the stop cancels (outside the stop bound) logs one line and keeps the cancel."""
+    app, _, _, _ = setup_app(monkeypatch)
+    started = asyncio.Event()
+
+    async def hang(query, original, **kw):
+        started.set()
+        await asyncio.Event().wait()
+    patch_invoke(app, functions.phone.DiscardCall, hang)
+    task = asyncio.create_task(app._discard_call(
+        types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7, g_a_hash=b'',
+                                 protocol=None), types.PhoneCallDiscardReasonMissed(), 7))
+    await started.wait()
+    app._stop.set()  # the stop is running (its own discards are bounded; this one started before it)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert warnings(caplog) == ['Discard interrupted for user=7 by the stop; the phone may ring until Telegram '
+                                'ends the call.']
+
+
+async def test_stop_during_the_ring_deadline_discard_logs_the_interrupt(monkeypatch, caplog):
+    """MOU-621 F1 row D-deadline-discard-then-stop: ring deadline -> DiscardCall(Missed) hangs -> stop cancels it."""
+    app, _, invoked, _ = setup_app(monkeypatch, kai_call_ring_timeout=0.05)
+    app.app.stop = AsyncMock()
+    started = asyncio.Event()
+
+    async def hang(query, original, **kw):
+        started.set()
+        await asyncio.Event().wait()
+    patch_invoke(app, functions.phone.DiscardCall, hang)
+    app._outbox_task = asyncio.create_task(app._call_outgoing('SECRET text'))
+    await asyncio.wait_for(started.wait(), 1)
+    assert not app._stop.is_set()  # the ring-deadline discard runs with Pyrogram defaults, no stop bound
+    caplog.set_level(logging.INFO)
+    loop = asyncio.get_running_loop()
+    begin = loop.time()
+    await asyncio.wait_for(app._shutdown(), 1)
+    assert loop.time() - begin < 0.3
+    assert warnings(caplog) == ['Discard interrupted for user=7 by the stop; the phone may ring until Telegram '
+                                'ends the call.']
+    assert 'SECRET' not in caplog.text
+    app.app.stop.assert_awaited_once()
+
+
+async def test_setup_deadline_cancelling_the_discard_does_not_blame_the_stop(monkeypatch, caplog):
+    """MOU-651 review: media setup fails -> DiscardCall(Disconnect) hangs -> the setup deadline (not the stop) cancels it."""
+    app, _, _, established = setup_app(monkeypatch, kai_call_ring_timeout=5, kai_call_setup_timeout=0.3)
+    app.ntg.connect_p2p.side_effect = RuntimeError('SECRET media')
+    started = asyncio.Event()
+
+    async def hang_first(query, original, **kw):
+        if started.is_set():
+            return None  # the cleanup discard after the setup deadline answers
+        started.set()
+        await asyncio.Event().wait()
+    patch_invoke(app, functions.phone.DiscardCall, hang_first)
+    caplog.set_level(logging.INFO)
+    dial, _ = await start_dial(app)
+    await accept(app, established)
+    assert await asyncio.wait_for(dial, 3) == 'failed'
+    assert started.is_set()
+    assert not app._stop.is_set()
+    interrupted = [m for m in warnings(caplog) if m.startswith('Discard interrupted')]
+    assert interrupted == ['Discard interrupted for user=7; the phone may ring until Telegram ends the call.']
+    assert any('Outgoing setup timed out after answer' in r.getMessage() for r in caplog.records)
+    assert 'SECRET' not in caplog.text
