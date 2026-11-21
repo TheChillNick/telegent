@@ -263,3 +263,22 @@ async def test_late_discard_fallback_wait_is_bounded_and_warns(monkeypatch, capl
     assert 'Ring discard not confirmed for 1 call(s)' in caplog.text
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_stop_time_discard_timeout_cancels_the_invoke(monkeypatch):
+    """MOU-621 F3: the stop-time deadline cancels the DiscardCall invoke itself (no shielded leftover)."""
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.05)
+    app, _, _, _ = setup_app(monkeypatch)
+    app._stop.set()
+    seen = []
+
+    async def hang(query, original, **kw):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            seen.append('cancelled')
+            raise
+    patch_invoke(app, functions.phone.DiscardCall, hang)
+    await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
+                                                     g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
+    assert seen == ['cancelled']
