@@ -141,9 +141,8 @@ async def test_hanging_discard_rpc_is_bounded_and_logged(monkeypatch, caplog):
     await asyncio.wait_for(app._shutdown(), 2)
     elapsed = loop.time() - started
     assert 0.15 < elapsed < 0.6, elapsed  # id at ~0.05 s, then the 0.2 s RPC bound; never the id bound + more
-    assert warnings(caplog) in ([
-        'Ring discard not confirmed for 1 call(s): DiscardCall still running 0 s after the id; '
-        'the phone may ring until Telegram ends the call.'], ['Discard failed for user=7: TimeoutError'])
+    # MOU-621 F2: one line on every Python (3.10 used to log the fallback line, 3.13 only the discard's own line)
+    assert warnings(caplog) == ['Discard failed for user=7: TimeoutError; the phone may ring until Telegram ends the call.']
     assert 'SECRET' not in caplog.text
     app.app.stop.assert_awaited_once()
     await cancel_leftovers(app)
@@ -260,7 +259,7 @@ async def test_late_discard_fallback_wait_is_bounded_and_warns(monkeypatch, capl
     app._late_discards[task] = request
     start = asyncio.get_running_loop().time()
     await asyncio.wait_for(app._finish_late_discards(), 0.5)
-    assert asyncio.get_running_loop().time() - start <= 0.2
+    assert asyncio.get_running_loop().time() - start <= 0.3  # STOP_DISCARD_TIMEOUT + DISCARD_GIVE_UP_MARGIN
     assert 'Ring discard not confirmed for 1 call(s)' in caplog.text
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -352,3 +351,29 @@ async def test_setup_deadline_cancelling_the_discard_does_not_blame_the_stop(mon
     assert interrupted == ['Discard interrupted for user=7; the phone may ring until Telegram ends the call.']
     assert any('Outgoing setup timed out after answer' in r.getMessage() for r in caplog.records)
     assert 'SECRET' not in caplog.text
+
+
+async def test_discard_failure_outside_the_stop_keeps_the_short_line(monkeypatch, caplog):
+    """MOU-621 F2: the phone-may-ring suffix is only for the stop; a normal failed discard keeps the old line."""
+    app, _, _, _ = setup_app(monkeypatch)
+
+    async def boom(query, original, **kw):
+        raise ConnectionError('SECRET peer text')
+    patch_invoke(app, functions.phone.DiscardCall, boom)
+    await app._discard_call(types.PhoneCallRequested(id=5, access_hash=6, date=0, admin_id=9, participant_id=7,
+                                                     g_a_hash=b'', protocol=None), types.PhoneCallDiscardReasonBusy(), 9)
+    assert warnings(caplog) == ['Discard failed for user=9: ConnectionError']
+    assert 'SECRET' not in caplog.text
+
+
+async def test_late_discard_fallback_waits_the_margin_past_the_rpc_bound(monkeypatch, caplog):
+    """MOU-621 F2: a late discard that ends just after STOP_DISCARD_TIMEOUT is awaited, no fallback line."""
+    monkeypatch.setattr(app_module, 'STOP_DISCARD_TIMEOUT', 0.1)
+    app, _, _, _ = setup_app(monkeypatch)
+    request = asyncio.get_running_loop().create_future()
+    request.set_result(None)
+    task = asyncio.create_task(asyncio.sleep(0.15))
+    app._late_discards[task] = request
+    await asyncio.wait_for(app._finish_late_discards(), 0.5)
+    assert task.done()
+    assert warnings(caplog) == []
