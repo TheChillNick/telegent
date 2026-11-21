@@ -51,6 +51,7 @@ async def _within(awaitable, seconds: float) -> tuple[bool, Any]:
 
 LATE_DISCARD_TIMEOUT = 5.0  # seconds the app stop waits for a late RequestCall id to discard
 STOP_DISCARD_TIMEOUT = 2.0  # seconds one DiscardCall may take during the app stop (no Pyrogram retries)
+DISCARD_GIVE_UP_MARGIN = 0.1  # the late-discard fallback waits this much longer, so the discard's own line wins
 NTG_STOP_TIMEOUT = 10.0  # seconds; then the session is unregistered, the user stays busy until the native stop ends
 
 
@@ -150,7 +151,7 @@ class TelegentApp:
         no_id = [task for task, request in pending.items() if not request.done()]
         sending = {task for task, request in pending.items() if request.done() and not task.done()}
         if sending:
-            _, sending = await asyncio.wait(sending, timeout=STOP_DISCARD_TIMEOUT)
+            _, sending = await asyncio.wait(sending, timeout=STOP_DISCARD_TIMEOUT + DISCARD_GIVE_UP_MARGIN)
         if no_id:
             self._log.warning("Ring discard not sent for %d call(s): no RequestCall id within %.0f s of the stop; "
                               "the phone may ring until Telegram ends the call.", len(no_id), LATE_DISCARD_TIMEOUT)
@@ -645,7 +646,19 @@ class TelegentApp:
             else:
                 await invocation
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("Discard failed for user=%s: %s", user_id, error_label(exc))
+            if self._stop.is_set():
+                self._log.warning("Discard failed for user=%s: %s; the phone may ring until Telegram ends the call.",
+                                  user_id, error_label(exc))
+            else:
+                self._log.warning("Discard failed for user=%s: %s", user_id, error_label(exc))
+        except asyncio.CancelledError:
+            if self._stop.is_set():
+                self._log.warning("Discard interrupted for user=%s by the stop; the phone may ring until Telegram "
+                                  "ends the call.", user_id)
+            else:  # e.g. the setup deadline cancels the media-failure discard
+                self._log.warning("Discard interrupted for user=%s; the phone may ring until Telegram ends the call.",
+                                  user_id)
+            raise
 
     def _make_stop(self, user_id: int):
         async def stop() -> None:
